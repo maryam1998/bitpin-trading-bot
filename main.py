@@ -7,6 +7,7 @@ from app.monitoring.health import start_health_server_in_background
 from app.bitpin.client import BitpinClient
 from app.portfolio.manager import PortfolioManager
 from app.portfolio.discovery import MarketDiscovery
+from app.market_data.manager import MarketDataManager
 from app.intelligence.market_intelligence import MarketIntelligence
 from app.intelligence.advisor import AIAdvisor
 from app.notifications.telegram import TelegramNotifier
@@ -175,6 +176,7 @@ def main():
     client = BitpinClient(settings.bitpin_base_url, settings.bitpin_api_key, settings.bitpin_api_secret)
     portfolio_mgr = PortfolioManager(client)
     discovery = MarketDiscovery(client)
+    market_data_mgr = MarketDataManager(settings)
     strategy = InitialStrategy()
     risk_mgr = RiskManager(settings)
     paper_engine = PaperTradingEngine()
@@ -183,8 +185,15 @@ def main():
     telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
     notifier = BroadcastNotifier(telegram)
 
-    advisor = AIAdvisor(settings)
-    intelligence = MarketIntelligence(settings)
+    # ===== وصل شد: AIAdvisor حالا به ابزارهای واقعی (قیمت زنده/پرتفولیو/تیکر) دسترسی دارد =====
+    advisor = AIAdvisor(
+        settings,
+        market_data_manager=market_data_mgr,
+        portfolio_manager=portfolio_mgr,
+        bitpin_client=client,
+    )
+    # ================================================================================
+    intelligence = MarketIntelligence(settings, portfolio_manager=portfolio_mgr, bitpin_client=client)
     threading.Thread(
         target=intelligence_loop,
         args=(intelligence, notifier, portfolio_mgr, settings.intelligence_interval_seconds),

@@ -9,10 +9,17 @@ log = logging.getLogger(__name__)
 
 
 class MarketIntelligence:
-    def __init__(self, settings):
+    def __init__(self, settings, portfolio_manager=None, bitpin_client=None):
         self.settings = settings
         self.market_manager = MarketDataManager(settings)
-        self.advisor = AIAdvisor(settings)
+        # ===== وصل شد: این AIAdvisor هم حالا به ابزار قیمت/بازار دسترسی دارد =====
+        self.advisor = AIAdvisor(
+            settings,
+            market_data_manager=self.market_manager,
+            portfolio_manager=portfolio_manager,
+            bitpin_client=bitpin_client,
+        )
+        # ==========================================================================
 
     def analyze(self, portfolio: Dict[str, float]) -> Dict[str, Any]:
         log.info("Running market intelligence...")
