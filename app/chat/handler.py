@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 log = logging.getLogger(__name__)
 
@@ -12,16 +12,14 @@ class ChatHandler:
         self.engine = engine
         self.watchlist = watchlist
         self.max_assets = max_assets
-        # ===== وصل شد: بدون این، بخش AI در چت هرگز فعال نمی‌شد =====
         self.advisor = advisor
         self.portfolio_mgr = portfolio_mgr
-        # ===========================================================
 
     def handle(self, chat_id: str, text: str) -> str:
         """پردازش پیام دریافتی و تولید پاسخ"""
         text = text.strip().lower()
 
-        # دستورات ساده
+        # ===== دستورات ساده =====
         if text in ["/start", "سلام", "hi"]:
             return "👋 سلام! من ربات تریدینگ هوشمند هستم.\nبرای مشاهده راهنما، /help را بفرستید."
 
@@ -31,6 +29,9 @@ class ChatHandler:
                 "/portfolio - نمایش وضعیت کیف پول\n"
                 "/signal BTC - دریافت سیگنال برای بیت‌کوین\n"
                 "/analysis - تحلیل کلی بازار\n"
+                "/forecast BTC - پیش‌بینی قیمت ۳۰ روز آینده\n"
+                "/forecast GOLD - پیش‌بینی قیمت طلا\n"
+                "/opportunities - نمایش بهترین فرصت‌های امروز\n"
                 "سوالات خود را به زبان فارسی بپرسید (مثلاً 'طلا بخرم؟')"
             )
 
@@ -43,11 +44,41 @@ class ChatHandler:
                 return self._get_signal(parts[1].upper())
             return "لطفاً یک ارز را مشخص کنید، مثلاً: /signal BTC"
 
+        # ===== دستورات جدید: پیش‌بینی و فرصت‌ها =====
+        elif text.startswith("/forecast"):
+            parts = text.split()
+            symbol = parts[1].upper() if len(parts) > 1 else "BTC"
+            try:
+                from app.forecast.report import ForecastReport
+                report = ForecastReport().generate_text_report(symbol, days=30)
+                return report
+            except Exception as e:
+                log.error(f"Forecast error for {symbol}: {e}")
+                return f"❌ خطا در دریافت پیش‌بینی برای {symbol}: {e}"
+
+        elif text == "/opportunities":
+            try:
+                from app.forecast.report import ForecastReport
+                ops = ForecastReport().get_top_opportunities()
+                if not ops:
+                    return "🔍 هیچ فرصت واضحی در حال حاضر شناسایی نشد."
+                lines = ["💎 **بهترین فرصت‌های امروز:**"]
+                for op in ops:
+                    lines.append(f"- {op['symbol']}: {op['recommendation']} ({op['change_percent']:+.2f}%)")
+                return "\n".join(lines)
+            except Exception as e:
+                log.error(f"Opportunities error: {e}")
+                return f"❌ خطا در دریافت فرصت‌ها: {e}"
+
+        # ===== تحلیل بازار (طلا، دلار، ...) =====
         elif "طلا" in text or "دلار" in text:
             return self._get_market_analysis(text)
 
+        # ===== پاسخ هوشمند (AI) =====
         else:
             return self._get_ai_response(text)
+
+    # ================= متدهای کمکی =================
 
     def _get_portfolio_info(self) -> str:
         """دریافت اطلاعات کیف پول از بیت‌پین"""
@@ -81,8 +112,34 @@ class ChatHandler:
             ticker = self.client.get_ticker(symbol)
             if not ticker:
                 return f"❌ نماد {symbol} یافت نشد."
-            price = float(ticker[0].get("price", 0))
-            return f"📈 **سیگنال {symbol}**\nقیمت فعلی: {price:,.2f} USDT\nتوصیه: نگهداری (تحلیل دقیق‌تر نیاز است)"
+
+            if isinstance(ticker, list):
+                ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
+            price = float(ticker.get("price", 0))
+
+            # استفاده از AI Advisor برای تحلیل (اگر در دسترس باشد)
+            if self.advisor is not None:
+                try:
+                    portfolio = {}
+                    if self.portfolio_mgr:
+                        snapshot = self.portfolio_mgr.fetch_snapshot()
+                        portfolio = {asset: bal.total for asset, bal in snapshot.balances.items()}
+                    opinion = self.advisor.get_recommendation(
+                        {"prices": {symbol: price}},
+                        portfolio,
+                    )
+                    return f"📈 **سیگنال {symbol}**\nقیمت فعلی: {price:,.2f} USDT\n\n🤖 تحلیل AI:\n{opinion}"
+                except Exception as e:
+                    log.warning(f"AI analysis error: {e}")
+
+            # تحلیل ساده (بدون AI)
+            if price < 500:
+                return f"📈 **سیگنال {symbol}**\nقیمت فعلی: {price:,.2f} USDT\nتوصیه: 🟢 BUY (قیمت پایین است)"
+            elif price > 50000:
+                return f"📈 **سیگنال {symbol}**\nقیمت فعلی: {price:,.2f} USDT\nتوصیه: 🔴 SELL (قیمت بالا است)"
+            else:
+                return f"📈 **سیگنال {symbol}**\nقیمت فعلی: {price:,.2f} USDT\nتوصیه: 🟡 HOLD (منتظر بمانید)"
+
         except Exception as e:
             return f"❌ خطا: {e}"
 
@@ -107,7 +164,7 @@ class ChatHandler:
         if not self.advisor:
             return "🤖 در حال حاضر هوش مصنوعی در دسترس نیست. لطفاً از دستورات /help استفاده کنید."
 
-        # به‌جای دیکشنری‌های خالی، داده‌ی واقعی قیمت و پرتفولیو را جمع می‌کنیم
+        # جمع‌آوری داده‌های واقعی قیمت و پرتفولیو
         prices = {}
         for symbol in self.watchlist[: self.max_assets]:
             try:
