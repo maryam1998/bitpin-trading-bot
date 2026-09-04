@@ -37,12 +37,39 @@ class BitpinClient:
         return self._request("GET", "/api/v1/mkt/tickers/", params=params)
 
     def get_markets(self):
-        """
-        دریافت لیست بازارهای معاملاتی بیت‌پین.
-        نکته: این اندپوینت روی الگوی get_ticker (/api/v1/mkt/...) ساخته شده،
-        اما مستندات رسمی بیت‌پین رو نداشتم که مسیر رو ۱۰۰٪ تایید کنم -
-        قبل از دیپلوی واقعی، این مسیر رو در برابر داکیومنت رسمی بیت‌پین چک کن.
-        """
         return self._request("GET", "/api/v1/mkt/markets/")
 
-    # متدهای دیگر (در صورت نیاز)
+    # ================= متد جدید: ارسال سفارش واقعی =================
+    def place_order(self, symbol: str, side: str, order_type: str, amount: float, price: float = None) -> dict:
+        """
+        ارسال سفارش واقعی به بیت‌پین
+        
+        Args:
+            symbol: نماد بازار (مثلاً 'BTC_USDT')
+            side: 'buy' یا 'sell'
+            order_type: 'market' یا 'limit'
+            amount: مقدار (به واحد base asset)
+            price: قیمت (برای سفارش limit)
+        
+        Returns:
+            پاسخ API شامل order_id و وضعیت سفارش
+        """
+        body = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "amount": str(amount),
+        }
+        if price and order_type == "limit":
+            body["price"] = str(price)
+
+        log.info(f"📤 Placing order: {side} {amount} {symbol} @ {price or 'market'}")
+        return self._request("POST", "/api/v1/odr/orders/", auth_required=True, json_body=body)
+
+    def get_order_status(self, order_id: str) -> dict:
+        """دریافت وضعیت یک سفارش"""
+        return self._request("GET", f"/api/v1/odr/orders/{order_id}/", auth_required=True)
+
+    def cancel_order(self, order_id: str) -> dict:
+        """لغو یک سفارش"""
+        return self._request("DELETE", f"/api/v1/odr/orders/{order_id}/", auth_required=True)
