@@ -35,7 +35,8 @@ class BroadcastNotifier:
     def send_paper_trade(self, message: str):
         log.info(f"PAPER TRADE: {message}")
         if self.telegram:
-            self.telegram.send_message(f"📄 {message}")
+            # حذف ایموجی تکراری (ایموجی قبلاً در main.py اضافه شده)
+            self.telegram.send_message(f"{message}")
 
     def send_ai_opinion(self, message: str):
         log.info(f"AI OPINION: {message}")
