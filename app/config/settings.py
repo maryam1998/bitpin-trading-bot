@@ -47,6 +47,7 @@ class Settings:
     # Polling
     poll_interval_seconds: int = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
     intelligence_interval_seconds: int = int(os.getenv("INTELLIGENCE_INTERVAL_SECONDS", "300"))
+    opportunity_check_interval: int = int(os.getenv("OPPORTUNITY_CHECK_INTERVAL", "300"))  # جدید
 
     # Database
     database_path: str = os.getenv("DATABASE_PATH", "trading_bot.db")
