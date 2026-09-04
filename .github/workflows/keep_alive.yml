@@ -1,0 +1,20 @@
+name: Keep Render Awake
+
+on:
+  schedule:
+    - cron: '*/4 * * * *'  # هر ۴ دقیقه یکبار
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Health
+        run: |
+          curl -s -o /dev/null -w "%{http_code}" https://bitpin-trading-bot.onrender.com/health || echo "Down"
+      - name: Notify if down
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=⚠️ ربات تریدینگ پاسخ نمی‌دهد! لطفاً بررسی کنید."
