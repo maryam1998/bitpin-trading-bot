@@ -8,6 +8,7 @@ from app.bitpin.client import BitpinClient
 from app.portfolio.manager import PortfolioManager
 from app.portfolio.discovery import MarketDiscovery
 from app.intelligence.market_intelligence import MarketIntelligence
+from app.intelligence.advisor import AIAdvisor
 from app.notifications.telegram import TelegramNotifier
 from app.notifications.broadcast import BroadcastNotifier
 from app.strategies.initial_strategy import InitialStrategy
@@ -22,7 +23,7 @@ from app.chat.handler import ChatHandler
 log = logging.getLogger("main")
 
 
-def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifier, paper_engine):
+def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifier, paper_engine, advisor=None):
     """یک چرخه‌ی کامل: دریافت پرتفولیو، بررسی بازارها، تولید سیگنال و (در صورت تایید ریسک) اجرای معامله."""
     snapshot = portfolio_mgr.fetch_snapshot()
     repo.save_portfolio_snapshot(
@@ -80,6 +81,19 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
                 f"{symbol} {signal.action.value} @ {signal.current_price:,.2f} - {signal.reason}"
             )
 
+            # ===== وصل شد: نظر هوش مصنوعی به‌عنوان تحلیل مکمل، قبل از اجرای معامله =====
+            if advisor is not None:
+                try:
+                    portfolio_amounts = {asset: bal.total for asset, bal in snapshot.balances.items()}
+                    opinion = advisor.get_recommendation(
+                        {"prices": {symbol: signal.current_price}},
+                        portfolio_amounts,
+                    )
+                    notifier.send_ai_opinion(f"{symbol}: {opinion}")
+                except Exception as e:
+                    log.warning(f"AI advisor error for {symbol}: {e}")
+            # ============================================================================
+
             if settings.mode == "PAPER":
                 position = paper_engine.open_position(signal, decision.max_position_usdt, signal.current_price)
                 if position:
@@ -120,11 +134,11 @@ def intelligence_loop(intelligence, notifier, portfolio_mgr, interval_seconds):
         time.sleep(interval_seconds)
 
 # ===== تابع جدید =====
-def chat_loop(telegram, client, discovery):
+def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
     """حلقه‌ی دریافت و پاسخ به پیام‌های تلگرام"""
     engine = MarketIntelligence(settings)
     watchlist = [a.strip().upper() for a in settings.watchlist if isinstance(settings.watchlist, list)]
-    handler = ChatHandler(client, discovery, engine, watchlist)
+    handler = ChatHandler(client, discovery, engine, watchlist, advisor=advisor, portfolio_mgr=portfolio_mgr)
     offset = None
     log.info("🤖 Telegram chat handler started")
     while True:
@@ -169,6 +183,7 @@ def main():
     telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
     notifier = BroadcastNotifier(telegram)
 
+    advisor = AIAdvisor(settings)
     intelligence = MarketIntelligence(settings)
     threading.Thread(
         target=intelligence_loop,
@@ -181,7 +196,7 @@ def main():
     if settings.telegram_chat_enabled and telegram.enabled:
         threading.Thread(
             target=chat_loop,
-            args=(telegram, client, discovery),
+            args=(telegram, client, discovery, advisor, portfolio_mgr),
             daemon=True,
             name="telegram-chat",
         ).start()
@@ -194,7 +209,7 @@ def main():
 
     while True:
         try:
-            run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifier, paper_engine)
+            run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifier, paper_engine, advisor)
         except Exception as e:
             log.exception(f"Cycle error: {e}")
         time.sleep(settings.poll_interval_seconds)

@@ -6,12 +6,16 @@ log = logging.getLogger(__name__)
 class ChatHandler:
     """مدیریت پیام‌های دریافتی از تلگرام"""
 
-    def __init__(self, client, discovery, engine, watchlist, max_assets=10):
+    def __init__(self, client, discovery, engine, watchlist, max_assets=10, advisor=None, portfolio_mgr=None):
         self.client = client
         self.discovery = discovery
         self.engine = engine
         self.watchlist = watchlist
         self.max_assets = max_assets
+        # ===== وصل شد: بدون این، بخش AI در چت هرگز فعال نمی‌شد =====
+        self.advisor = advisor
+        self.portfolio_mgr = portfolio_mgr
+        # ===========================================================
 
     def handle(self, chat_id: str, text: str) -> str:
         """پردازش پیام دریافتی و تولید پاسخ"""
@@ -100,10 +104,31 @@ class ChatHandler:
 
     def _get_ai_response(self, text: str) -> str:
         """دریافت پاسخ هوشمند از هوش مصنوعی (اگر فعال باشد)"""
-        # اگر هوش مصنوعی فعال است، از آن استفاده کن
-        if hasattr(self, 'advisor') and self.advisor:
+        if not self.advisor:
+            return "🤖 در حال حاضر هوش مصنوعی در دسترس نیست. لطفاً از دستورات /help استفاده کنید."
+
+        # به‌جای دیکشنری‌های خالی، داده‌ی واقعی قیمت و پرتفولیو را جمع می‌کنیم
+        prices = {}
+        for symbol in self.watchlist[: self.max_assets]:
             try:
-                return self.advisor.get_recommendation({"prices": {}}, {})
-            except:
-                pass
-        return "🤖 در حال حاضر هوش مصنوعی در دسترس نیست. لطفاً از دستورات /help استفاده کنید."
+                ticker = self.client.get_ticker(symbol)
+                if isinstance(ticker, list) and ticker:
+                    prices[symbol] = float(ticker[0].get("price", 0))
+                elif isinstance(ticker, dict):
+                    prices[symbol] = float(ticker.get("price", 0))
+            except Exception as e:
+                log.warning(f"Could not fetch price for {symbol}: {e}")
+
+        portfolio = {}
+        if self.portfolio_mgr:
+            try:
+                snapshot = self.portfolio_mgr.fetch_snapshot()
+                portfolio = {asset: bal.total for asset, bal in snapshot.balances.items()}
+            except Exception as e:
+                log.warning(f"Could not fetch portfolio for AI context: {e}")
+
+        try:
+            return self.advisor.get_recommendation({"prices": prices}, portfolio)
+        except Exception as e:
+            log.error(f"AI response error: {e}")
+            return "🤖 خطا در دریافت پاسخ هوش مصنوعی. لطفاً بعداً دوباره تلاش کنید."
