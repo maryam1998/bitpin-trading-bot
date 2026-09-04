@@ -1,5 +1,5 @@
 """
-ربات تریدینگ هوشمند - نسخه نهایی با AI Agent، اجرای واقعی و یادگیری
+ربات تریدینگ هوشمند - نسخه نهایی با AI Agent، اجرای واقعی، یادگیری و ارسال خودکار فرصت‌ها
 """
 import logging
 import threading
@@ -22,6 +22,7 @@ from app.execution.live import LiveExecutionEngine
 from app.database.repository import Repository
 from app.strategies.base import Action
 from app.chat.handler import ChatHandler
+from app.forecast.report import ForecastReport  # جدید
 
 log = logging.getLogger("main")
 
@@ -238,6 +239,54 @@ def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
             time.sleep(5)
 
 
+# ===== تابع جدید: حلقه‌ی خودکار ارسال فرصت‌ها =====
+def opportunity_loop(notifier, interval_seconds: int):
+    """حلقه‌ی دوره‌ای برای بررسی و ارسال خودکار فرصت‌های معاملاتی"""
+    forecast = ForecastReport()
+    last_opportunities = {}
+
+    while True:
+        try:
+            log.info("🔍 Checking for new opportunities...")
+            opportunities = forecast.get_top_opportunities(
+                symbols=["BTC", "ETH", "GOLD", "USD", "BNB", "ADA", "SHIB", "DOGE", "SOL"]
+            )
+
+            if opportunities:
+                lines = ["💎 **فرصت‌های جدید شناسایی‌شده:**"]
+                new_opps = []
+
+                for opp in opportunities:
+                    symbol = opp["symbol"]
+                    recommendation = opp["recommendation"]
+                    change = opp.get("change_percent", 0)
+                    confidence = opp.get("confidence", "متوسط")
+
+                    # اگر این فرصت قبلاً ارسال نشده یا تغییر کرده، ارسال کن
+                    if symbol not in last_opportunities or last_opportunities[symbol] != recommendation:
+                        new_opps.append(
+                            f"- {symbol}: {recommendation} ({change:+.2f}%) - اطمینان: {confidence}"
+                        )
+                        last_opportunities[symbol] = recommendation
+
+                if new_opps:
+                    lines.extend(new_opps)
+                    message = "\n".join(lines)
+                    notifier.send_opportunity(message)
+                    log.info(f"✅ Sent {len(new_opps)} new opportunities")
+                else:
+                    log.info("No new opportunities to send")
+            else:
+                log.info("No opportunities available")
+
+        except Exception as e:
+            log.exception(f"❌ Error in opportunity loop: {e}")
+            notifier.send_error(f"Opportunity loop error: {e}")
+
+        time.sleep(interval_seconds)
+# =================================================
+
+
 def main():
     from app.monitoring.logger import setup_logging
     setup_logging()
@@ -308,6 +357,15 @@ def main():
         log.info("📨 Telegram chat handler started")
     else:
         log.info("Telegram chat disabled")
+
+    # ===== شروع حلقه‌ی خودکار فرصت‌ها (جدید) =====
+    threading.Thread(
+        target=opportunity_loop,
+        args=(notifier, settings.opportunity_check_interval),
+        daemon=True,
+        name="opportunity-loop",
+    ).start()
+    log.info(f"💎 Opportunity loop started (every {settings.opportunity_check_interval}s)")
 
     # ---------- هشدار LIVE ----------
     if settings.mode == "LIVE" and live_engine is not None:
