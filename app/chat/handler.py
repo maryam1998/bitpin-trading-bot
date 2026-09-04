@@ -44,7 +44,6 @@ class ChatHandler:
                 return self._get_signal(parts[1].upper())
             return "لطفاً یک ارز را مشخص کنید، مثلاً: /signal BTC"
 
-        # ===== دستورات جدید: پیش‌بینی و فرصت‌ها =====
         elif text.startswith("/forecast"):
             parts = text.split()
             symbol = parts[1].upper() if len(parts) > 1 else "BTC"
@@ -70,36 +69,71 @@ class ChatHandler:
                 log.error(f"Opportunities error: {e}")
                 return f"❌ خطا در دریافت فرصت‌ها: {e}"
 
-        # ===== تحلیل بازار (طلا، دلار، ...) =====
         elif "طلا" in text or "دلار" in text:
             return self._get_market_analysis(text)
 
-        # ===== پاسخ هوشمند (AI) =====
         else:
             return self._get_ai_response(text)
 
     # ================= متدهای کمکی =================
 
     def _get_portfolio_info(self) -> str:
-        """دریافت اطلاعات کیف پول از بیت‌پین"""
+        """دریافت اطلاعات کیف پول از بیت‌پین با نمایش صحیح موجودی و ارزش کل"""
         try:
             wallets = self.client._request("GET", "/api/v1/wlt/wallets/", auth_required=True)
             if not wallets:
                 return "❌ اطلاعات کیف پول در دسترس نیست."
 
-            lines = ["📊 **وضعیت کیف پول:**"]
+            # دریافت قیمت USDT/IRT برای تبدیل
+            try:
+                ticker = self.client.get_ticker("USDT_IRT")
+                if isinstance(ticker, list):
+                    ticker = next((t for t in ticker if t.get("symbol") == "USDT_IRT"), {})
+                usdt_irt_price = float(ticker.get("price", 0))
+            except:
+                usdt_irt_price = 0.0
+
+            # محاسبه مجموع به تومان و USDT
+            total_irt = 0.0
             total_usdt = 0.0
+            lines = ["📊 **وضعیت کیف پول:**"]
 
             for item in wallets:
                 asset = item.get("asset", "")
                 balance = float(item.get("balance", 0))
                 available = float(item.get("available", 0))
-                if balance > 0:
-                    lines.append(f"• {asset}: {balance:.2f} (قابل استفاده: {available:.2f})")
-                    if asset == "USDT":
-                        total_usdt = available
+                frozen = float(item.get("frozen", 0))
 
+                if balance <= 0:
+                    continue
+
+                # نمایش هر دارایی
+                lines.append(f"• {asset}: {balance:.2f} (قابل استفاده: {available:.2f})")
+
+                # محاسبه ارزش به تومان (برای مجموع)
+                if asset == "IRT":
+                    value_irt = balance
+                elif asset == "USDT":
+                    value_irt = balance * usdt_irt_price
+                    total_usdt += balance  # جمع USDT با موجودی واقعی
+                else:
+                    # قیمت ارز به USDT (با استفاده از ticker)
+                    try:
+                        ticker_asset = self.client.get_ticker(f"{asset}_USDT")
+                        if isinstance(ticker_asset, list):
+                            ticker_asset = next((t for t in ticker_asset if t.get("symbol") == f"{asset}_USDT"), {})
+                        price_usdt = float(ticker_asset.get("price", 0))
+                        value_irt = balance * price_usdt * usdt_irt_price
+                        total_usdt += balance * price_usdt
+                    except:
+                        value_irt = 0.0
+
+                total_irt += value_irt
+
+            # اضافه کردن مجموع به گزارش
             lines.append(f"\n💰 مجموع: {total_usdt:.2f} USDT")
+            lines.append(f"💰 معادل تومان: {total_irt:,.0f} IRT")
+
             return "\n".join(lines)
 
         except Exception as e:
