@@ -56,12 +56,13 @@ SYSTEM_PROMPT_CHAT = """شما یک مشاور مالی و تحلیلگر باز
 """
 
 class AIAdvisor:
-    def __init__(self, settings, market_data_manager=None, portfolio_manager=None, bitpin_client=None):
+    def __init__(self, settings, market_data_manager=None, portfolio_manager=None, bitpin_client=None, repository=None):
         self.settings = settings
         self.client = None
         self.market_data_manager = market_data_manager
         self.portfolio_manager = portfolio_manager
         self.bitpin_client = bitpin_client
+        self.repository = repository  # برای ذخیره‌سازی عملکرد AI
 
         if settings.ai_enabled and settings.ai_api_key:
             if settings.ai_provider == "openai":
@@ -535,3 +536,68 @@ class AIAdvisor:
             return "🔍 تحلیل ساده:\n" + "\n".join(recs)
         else:
             return "🔍 هیچ فرصت واضحی در حال حاضر شناسایی نشد."
+
+    # ================= بخش جدید: یادگیری از نتایج =================
+
+    def learn_from_trade(self, symbol: str, decision: str, entry_price: float, exit_price: float):
+        """یادگیری از نتیجه یک معامله برای بهبود تصمیم‌گیری آینده"""
+        try:
+            profit_percent = ((exit_price - entry_price) / entry_price) * 100
+            
+            # محاسبه امتیاز (بر اساس سود/زیان)
+            if profit_percent > 10:
+                score = 10  # عالی
+            elif profit_percent > 5:
+                score = 7   # خوب
+            elif profit_percent > 0:
+                score = 5   # متوسط
+            elif profit_percent > -5:
+                score = 3   # بد
+            else:
+                score = 1   # خیلی بد
+            
+            feedback = f"Entry: {entry_price:.2f}, Exit: {exit_price:.2f}, Profit: {profit_percent:.2f}%"
+            
+            # ذخیره در دیتابیس
+            if self.repository is not None:
+                self.repository.save_ai_performance(
+                    symbol=symbol,
+                    decision=decision,
+                    expected_profit=profit_percent,
+                    actual_profit=profit_percent,
+                    score=score,
+                    feedback=feedback
+                )
+                log.info(f"🧠 AI learned from trade: {symbol} -> {profit_percent:.2f}% (score: {score})")
+            else:
+                log.warning("📁 Repository not available for learning")
+            
+            return score
+        except Exception as e:
+            log.error(f"Learning error: {e}")
+            return 0
+
+    def get_learning_summary(self, symbol: str = None) -> str:
+        """گرفتن خلاصه عملکرد AI برای یک نماد"""
+        if self.repository is None:
+            return "📊 داده‌های یادگیری در دسترس نیست"
+        
+        records = self.repository.get_ai_performance(symbol, limit=20)
+        if not records:
+            return f"📊 هیچ داده‌ی یادگیری برای {symbol or 'همه نمادها'} وجود ندارد"
+        
+        total = len(records)
+        wins = sum(1 for r in records if r['profit_percent'] > 0)
+        win_rate = (wins / total) * 100 if total > 0 else 0
+        avg_profit = sum(r['profit_percent'] for r in records) / total if total > 0 else 0
+        best = max(r['profit_percent'] for r in records) if records else 0
+        worst = min(r['profit_percent'] for r in records) if records else 0
+        
+        return f"""
+📊 **خلاصه عملکرد AI** ({symbol or 'همه نمادها'})
+تعداد تصمیمات: {total}
+موفقیت: {wins} / {total} ({win_rate:.1f}%)
+میانگین سود: {avg_profit:.2f}%
+بهترین تصمیم: {best:.2f}%
+بدترین تصمیم: {worst:.2f}%
+"""
