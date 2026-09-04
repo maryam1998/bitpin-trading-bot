@@ -17,15 +17,13 @@ from app.risk.manager import RiskManager
 from app.execution.paper import PaperTradingEngine
 from app.database.repository import Repository
 from app.strategies.base import Action
-# ===== اضافه کنید =====
 from app.chat.handler import ChatHandler
-# =====================
 
 log = logging.getLogger("main")
 
 
 def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifier, paper_engine, advisor=None):
-    """یک چرخه‌ی کامل: دریافت پرتفولیو، بررسی بازارها، تولید سیگنال و (در صورت تایید ریسک) اجرای معامله."""
+    """یک چرخه‌ی کامل با تصمیم‌گیری AI"""
     snapshot = portfolio_mgr.fetch_snapshot()
     repo.save_portfolio_snapshot(
         snapshot.total_value_usdt,
@@ -42,20 +40,23 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
 
     for asset, symbol in markets.items():
         try:
-            ticker = client.get_ticker(symbol)
-            if isinstance(ticker, list):
-                ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
-            elif not isinstance(ticker, dict):
-                ticker = {}
+            # ===== تغییر اصلی: استفاده از AI برای تصمیم‌گیری =====
+            if advisor is not None and settings.ai_enabled:
+                signal = advisor.decide(asset, symbol)
+                log.info(f"AI decision for {symbol}: {signal.action.value} - {signal.reason}")
+            else:
+                # Fallback به استراتژی قانون‌محور
+                ticker = client.get_ticker(symbol)
+                if isinstance(ticker, list):
+                    ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
+                elif not isinstance(ticker, dict):
+                    ticker = {}
+                signal = strategy.evaluate({"symbol": symbol, "ticker": ticker})
+            # ===================================================
 
-            signal = strategy.evaluate({"symbol": symbol, "ticker": ticker})
             repo.log_signal(signal)
 
-            if signal.action in (Action.WAIT,):
-                continue
-
-            if signal.action == Action.DO_NOT_TRADE:
-                notifier.send_do_not_trade(f"{symbol}: {signal.reason}")
+            if signal.action in (Action.WAIT, Action.DO_NOT_TRADE):
                 continue
 
             current_exposure_usdt = snapshot.exposure_by_asset().get(asset, 0.0) * signal.current_price
@@ -67,7 +68,6 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
                 available_usdt=snapshot.available_usdt,
                 current_asset_exposure_usdt=current_exposure_usdt,
                 total_exposure_usdt=total_exposure_usdt,
-                # هنوز اندپوینت اردربوک پیاده نشده؛ فعلاً به‌عنوان placeholder از min_liquidity استفاده می‌کنیم
                 orderbook_liquidity_usdt=settings.min_liquidity,
                 estimated_slippage_percent=signal.slippage_percent,
                 price_age_seconds=0.0,
@@ -82,7 +82,7 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
                 f"{symbol} {signal.action.value} @ {signal.current_price:,.2f} - {signal.reason}"
             )
 
-            # ===== وصل شد: نظر هوش مصنوعی به‌عنوان تحلیل مکمل، قبل از اجرای معامله =====
+            # ===== نظر هوش مصنوعی به‌عنوان تحلیل مکمل =====
             if advisor is not None:
                 try:
                     portfolio_amounts = {asset: bal.total for asset, bal in snapshot.balances.items()}
@@ -93,7 +93,7 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
                     notifier.send_ai_opinion(f"{symbol}: {opinion}")
                 except Exception as e:
                     log.warning(f"AI advisor error for {symbol}: {e}")
-            # ============================================================================
+            # =============================================
 
             if settings.mode == "PAPER":
                 position = paper_engine.open_position(signal, decision.max_position_usdt, signal.current_price)
@@ -102,7 +102,6 @@ def run_cycle(client, portfolio_mgr, discovery, strategy, risk_mgr, repo, notifi
                         f"{symbol} {signal.action.value} حجم={decision.max_position_usdt:.2f} USDT @ {signal.current_price:,.2f}"
                     )
             elif settings.mode == "LIVE":
-                # هشدار: place_order هنوز پیاده نشده - در LIVE mode فعلاً هیچ سفارشی ارسال نمی‌شود
                 msg = f"{symbol}: حالت LIVE فعال است ولی ارسال سفارش واقعی هنوز پیاده‌سازی نشده"
                 log.error(msg)
                 notifier.send_error(msg)
@@ -134,7 +133,7 @@ def intelligence_loop(intelligence, notifier, portfolio_mgr, interval_seconds):
 
         time.sleep(interval_seconds)
 
-# ===== تابع جدید =====
+
 def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
     """حلقه‌ی دریافت و پاسخ به پیام‌های تلگرام"""
     engine = MarketIntelligence(settings)
@@ -156,7 +155,7 @@ def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
             telegram.send_to(chat_id, reply)
         if not updates:
             time.sleep(1)
-# ====================
+
 
 def main():
     from app.monitoring.logger import setup_logging
@@ -185,14 +184,14 @@ def main():
     telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
     notifier = BroadcastNotifier(telegram)
 
-    # ===== وصل شد: AIAdvisor حالا به ابزارهای واقعی (قیمت زنده/پرتفولیو/تیکر) دسترسی دارد =====
+    # ===== AIAdvisor با ابزارهای واقعی =====
     advisor = AIAdvisor(
         settings,
         market_data_manager=market_data_mgr,
         portfolio_manager=portfolio_mgr,
         bitpin_client=client,
     )
-    # ================================================================================
+
     intelligence = MarketIntelligence(settings, portfolio_manager=portfolio_mgr, bitpin_client=client)
     threading.Thread(
         target=intelligence_loop,
@@ -201,7 +200,6 @@ def main():
     ).start()
     log.info("🧠 Market Intelligence started")
 
-    # ===== اضافه کنید =====
     if settings.telegram_chat_enabled and telegram.enabled:
         threading.Thread(
             target=chat_loop,
@@ -212,7 +210,6 @@ def main():
         log.info("📨 Telegram chat handler started")
     else:
         log.info("Telegram chat disabled")
-    # =====================
 
     log.info("✅ Bot started successfully")
 
@@ -222,6 +219,7 @@ def main():
         except Exception as e:
             log.exception(f"Cycle error: {e}")
         time.sleep(settings.poll_interval_seconds)
+
 
 if __name__ == "__main__":
     main()
