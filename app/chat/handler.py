@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Any, List
 from app.strategies.base import Action
+from app.bitpin.pricing import MarketSymbolResolver, extract_ticker_price, find_ticker
 
 log = logging.getLogger(__name__)
 
@@ -13,6 +14,9 @@ class ChatHandler:
         self.max_assets = max_assets
         self.advisor = advisor
         self.portfolio_mgr = portfolio_mgr
+        # ===== اصلاح: تشخیص نماد دقیق بازار از لیست واقعی بازارها، به‌جای
+        # حدس مستقیم "{asset}_USDT" - رفع مشکل قیمت SHIB =====
+        self._symbol_resolver = MarketSymbolResolver(client)
 
     def handle(self, chat_id: str, text: str) -> str:
         # ===== اصلاح: هیچ‌وقت نباید پاسخ کاملاً خالی/بی‌صدا برگردد =====
@@ -85,37 +89,45 @@ class ChatHandler:
         """دریافت اطلاعات کیف پول با محاسبه‌ی available = balance - frozen"""
         try:
             wallets = self.client._request("GET", "/api/v1/wlt/wallets/", auth_required=True)
+            # اگر endpoint صفحه‌بندی‌شده پاسخ بدهد، به یک لیست ساده تبدیل می‌شود
+            if isinstance(wallets, dict):
+                wallets = wallets.get("results") or []
             if not wallets:
                 return "❌ اطلاعات کیف پول در دسترس نیست."
 
             # دریافت قیمت USDT/IRT
             try:
-                ticker = self.client.get_ticker("USDT_IRT")
-                if isinstance(ticker, list):
-                    ticker = next((t for t in ticker if t.get("symbol") == "USDT_IRT"), {})
-                usdt_irt_price = float(ticker.get("price", 0))
-            except:
+                tickers = self.client.get_ticker("USDT_IRT")
+                ticker = find_ticker(tickers, "USDT_IRT")
+                usdt_irt_price = extract_ticker_price(ticker)
+            except Exception:
                 usdt_irt_price = 0.0
 
             if usdt_irt_price <= 0:
                 return "❌ قیمت USDT/IRT در دسترس نیست."
 
-            # ===== اصلاح: محاسبه available از balance - frozen، و جمع‌کردن
-            # (نه جایگزینی) چند ردیف احتمالی برای یک دارایی =====
+            # ===== اصلاح اصلی مغایرت موجودی =====
+            # فیلد "balance" فقط بخش آزاد/قابل‌برداشت است، نه کل دارایی؛
+            # "frozen" مبلغی است که جدا از آن (مثلاً در یک سفارش باز) قفل
+            # شده. نسخه‌ی قبلی "balance" را به‌تنهایی به‌عنوان «کل» در نظر
+            # می‌گرفت، پس هر مبلغی که در سفارش باز قفل بود (در این حساب
+            # ~۱۰۰ USDT) از گزارش کیف‌پول به‌طور کامل گم می‌شد؛ در حالی که
+            # بیت‌پین آن را در «کل» لحاظ می‌کند. علاوه بر این، چند ردیف
+            # احتمالی برای یک دارایی جمع (نه جایگزین) می‌شوند.
             balances = {}
             for item in wallets:
                 asset = item.get("asset", "")
-                balance = float(item.get("balance", 0))
-                frozen = float(item.get("frozen", 0))
-                # فیلد available واقعاً 0 برمی‌گرداند، پس محاسبه می‌کنیم
-                available = float(item.get("available") or (balance - frozen))
-                if balance <= 0:
+                free = float(item.get("balance", 0) or 0)
+                frozen = float(item.get("frozen", 0) or 0)
+                total = free + frozen
+                if total <= 0:
                     continue
+                log.info(f"💰 wallet raw: asset={asset} balance(free)={free} frozen={frozen} -> total={total}")
                 if asset in balances:
-                    balances[asset]["balance"] += balance
-                    balances[asset]["available"] += available
+                    balances[asset]["balance"] += total
+                    balances[asset]["available"] += free
                 else:
-                    balances[asset] = {"balance": balance, "available": available}
+                    balances[asset] = {"balance": total, "available": free}
             # ========================================================
 
             total_irt = 0.0
@@ -131,20 +143,25 @@ class ChatHandler:
                 else:
                     value_irt = None
                     try:
-                        ticker_asset = self.client.get_ticker(f"{asset}_USDT")
-                        if isinstance(ticker_asset, list):
-                            ticker_asset = next((t for t in ticker_asset if t.get("symbol") == f"{asset}_USDT"), {})
-                        price_usdt = float(ticker_asset.get("price", 0))
+                        # ===== اصلاح: نماد دقیق بازار از لیست واقعی بازارها
+                        # گرفته می‌شود، نه با حدس مستقیم "{asset}_USDT" -
+                        # همین حدس باعث می‌شد قیمت SHIB پیدا نشود، چون نماد
+                        # واقعی بازار آن روی بیت‌پین لزوماً همین فرمت نیست. =====
+                        usdt_symbol = self._symbol_resolver.resolve(asset, "USDT")
+                        ticker_asset = self.client.get_ticker(usdt_symbol)
+                        price_usdt = extract_ticker_price(find_ticker(ticker_asset, usdt_symbol))
                         if price_usdt > 0:
                             value_irt = balance * price_usdt * usdt_irt_price
                         else:
-                            ticker_irt = self.client.get_ticker(f"{asset}_IRT")
-                            if isinstance(ticker_irt, list):
-                                ticker_irt = next((t for t in ticker_irt if t.get("symbol") == f"{asset}_IRT"), {})
-                            price_irt = float(ticker_irt.get("price", 0))
+                            irt_symbol = self._symbol_resolver.resolve(asset, "IRT")
+                            ticker_irt = self.client.get_ticker(irt_symbol)
+                            price_irt = extract_ticker_price(find_ticker(ticker_irt, irt_symbol))
                             if price_irt > 0:
                                 value_irt = balance * price_irt
-                    except Exception:
+                            else:
+                                log.info(f"⚠️ قیمت معتبری برای {asset} پیدا نشد (نه {usdt_symbol}, نه {irt_symbol}).")
+                    except Exception as e:
+                        log.warning(f"خطا در قیمت‌گیری {asset}: {e}")
                         value_irt = None
 
                 if value_irt is None:

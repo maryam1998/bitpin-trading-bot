@@ -2,6 +2,8 @@ import logging
 from typing import Dict, List, Any
 from dataclasses import dataclass, field
 
+from app.bitpin.pricing import MarketSymbolResolver, extract_ticker_price, find_ticker
+
 log = logging.getLogger(__name__)
 
 @dataclass
@@ -26,6 +28,11 @@ class PortfolioManager:
     def __init__(self, client):
         self.client = client
         self._price_cache = {}
+        # ===== اصلاح: به‌جای حدس‌زدن مستقیم نماد بازار (مثلاً فرض کردن
+        # SHIB_USDT وجود دارد)، از لیست واقعی بازارهای بیت‌پین استفاده
+        # می‌کنیم. این باعث می‌شد قیمت SHIB "در دسترس نیست" گزارش شود،
+        # درحالی‌که بیت‌پین قیمت آن را (احتمالاً با نماد بازار متفاوتی) دارد.
+        self._symbol_resolver = MarketSymbolResolver(client)
 
     def _get_ticker_price(self, symbol: str) -> float:
         """
@@ -37,11 +44,11 @@ class PortfolioManager:
 
         price = 0.0
         try:
-            ticker = self.client.get_ticker(symbol)
-            if isinstance(ticker, list):
-                ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
-            if isinstance(ticker, dict):
-                price = float(ticker.get("price", 0) or 0)
+            tickers = self.client.get_ticker(symbol)
+            ticker = find_ticker(tickers, symbol)
+            price = extract_ticker_price(ticker)
+            if price == 0.0:
+                log.info(f"⚠️ قیمت معتبری برای نماد {symbol} در پاسخ تیکر پیدا نشد.")
         except Exception as e:
             log.warning(f"خطا در دریافت قیمت {symbol}: {e}")
             price = 0.0
@@ -58,16 +65,20 @@ class PortfolioManager:
         قیمت یک دارایی به تومان.
         ابتدا از بازار {asset}_USDT استفاده و به تومان تبدیل می‌شود،
         و در صورت نبود آن بازار، از {asset}_IRT مستقیم استفاده می‌شود.
+        نماد دقیق هر بازار از لیست واقعی بازارها (نه حدس) گرفته می‌شود.
         """
         usdt_irt = self._get_usdt_irt_price()
-        price_usdt = self._get_ticker_price(f"{asset}_USDT")
+        usdt_symbol = self._symbol_resolver.resolve(asset, "USDT")
+        price_usdt = self._get_ticker_price(usdt_symbol)
         if price_usdt > 0 and usdt_irt > 0:
             return price_usdt * usdt_irt
 
-        price_irt = self._get_ticker_price(f"{asset}_IRT")
+        irt_symbol = self._symbol_resolver.resolve(asset, "IRT")
+        price_irt = self._get_ticker_price(irt_symbol)
         if price_irt > 0:
             return price_irt
 
+        log.warning(f"⚠️ قیمت معتبری برای دارایی {asset} پیدا نشد (نه {usdt_symbol}, نه {irt_symbol})؛ در جمع کل لحاظ نمی‌شود.")
         return 0.0
 
     def fetch_snapshot(self) -> PortfolioSnapshot:
@@ -75,6 +86,12 @@ class PortfolioManager:
         self._price_cache = {}
         try:
             wallets = self.client._request("GET", "/api/v1/wlt/wallets/", auth_required=True)
+            # ===== اصلاح احتیاطی: اگر endpoint صفحه‌بندی‌شده (paginated) پاسخ
+            # بدهد ({"count":.., "results":[...]})، آن را به یک لیست ساده تبدیل
+            # می‌کنیم؛ در غیر این صورت با کد قدیمی، ردیف‌های صفحه‌ی بعدی
+            # به‌سادگی نادیده گرفته می‌شدند و بخشی از موجودی گم می‌شد.
+            if isinstance(wallets, dict):
+                wallets = wallets.get("results") or []
             if not wallets:
                 log.error("No wallet data received")
                 return PortfolioSnapshot()
@@ -100,10 +117,22 @@ class PortfolioManager:
             # اپ بیت‌پین باشه.
             for item in wallets:
                 asset = item.get("asset", "")
-                total = float(item.get("balance", 0))
-                frozen = float(item.get("frozen", 0))
-                # ===== اصلاح: محاسبه available در صورت نبودن فیلد =====
-                available = float(item.get("available", total - frozen))
+                # ===== اصلاح اصلی مغایرت موجودی =====
+                # فیلد "balance" در پاسخ /wlt/wallets/ فقط بخش آزاد/قابل‌برداشت
+                # موجودی است، نه کل دارایی؛ "frozen" مبلغی است که جدا از آن (مثلاً
+                # به‌خاطر یک سفارش باز) قفل شده. کد قبلی "balance" را به‌تنهایی
+                # به‌عنوان «کل» در نظر می‌گرفت، پس هر مبلغی که در سفارش باز قفل
+                # بود از «کل دارایی» به‌طور کامل گم می‌شد (در حساب واقعی این
+                # پروژه دقیقاً همین اتفاق برای حدود ۱۰۰ USDT افتاده بود، هرچند
+                # بیت‌پین آن را در «کل» حساب می‌کند). فیلد "available" که API
+                # برمی‌گرداند غیرقابل‌اعتماد است (طبق مشاهدات این پروژه گاهی 0
+                # برمی‌گردد)، پس available را مستقیماً از balance می‌گیریم.
+                free = float(item.get("balance", 0) or 0)
+                frozen = float(item.get("frozen", 0) or 0)
+                total = free + frozen
+                available = free
+
+                log.info(f"💰 wallet raw: asset={asset} balance(free)={free} frozen={frozen} -> total={total}")
 
                 if total == 0:
                     continue
