@@ -88,9 +88,14 @@ class MarketIntelligence:
         نسخه‌ی سبک برای گرفتن فرصت‌های واقعی بازار بدون فراخوانی AI advisor -
         برای استفاده در گزارش کیف پول (که فقط به لیست فرصت‌ها نیاز داره، نه
         یک تحلیل متنی کامل که هزینه/تاخیر اضافه ایجاد کنه).
+
+        ===== اصلاح تاخیر: فقط قیمت نمادهای واقعاً لازم رو می‌گیریم (۱۰ تا
+        رمزارز مشخص)، نه کل watchlist (که شامل طلا/دلار/یورو هم می‌شد و هر
+        کدوم یه درخواست شبکه‌ی جدا با تایم‌اوت جدا داشت) - این تنها تغییر
+        باعث شد گزارش کیف پول چند برابر سریع‌تر بشه.
         """
         try:
-            prices = self.market_manager.get_all_prices()
+            prices = self.market_manager.get_all_prices(symbols=TRADABLE_FOR_OPPORTUNITIES)
             return self._find_opportunities(prices, portfolio)
         except Exception as e:
             log.warning(f"get_opportunities failed: {e}")

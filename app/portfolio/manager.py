@@ -79,12 +79,25 @@ class PortfolioManager:
                 log.error("No wallet data received")
                 return PortfolioSnapshot()
 
+            # لاگ تشخیصی: اگه بازم مغایرت بود، این خط دقیقاً نشون می‌ده API
+            # چند ردیف برای هر دارایی برگردونده (کمک به دیباگ بعدی)
+            log.info(f"📦 wallets raw rows: {len(wallets)} | assets: {[w.get('asset') for w in wallets]}")
+
             balances = {}
             irit_balance = 0.0
             usdt_balance = 0.0
             asset_values_irt = {}
             asset_balances = {}
 
+            # ===== اصلاح مهم: جمع‌کردن (نه جایگزینی) موجودی وقتی چند ردیف
+            # برای یک دارایی برمی‌گرده =====
+            # مستندات SDKهای غیررسمی بیت‌پین نشون میدن این endpoint می‌تونه
+            # بر اساس "service" (مثلاً spot در مقابل انواع دیگر) چند ردیف
+            # جدا برای یک ارز برگردونه. کد قبلی با balances[asset] = ...
+            # هر ردیف رو جایگزین ردیف قبلی می‌کرد، یعنی اگه دو ردیف USDT
+            # وجود داشت، فقط آخری حساب می‌شد و بقیه‌ی موجودی واقعی کاربر
+            # گم می‌شد - همین باعث می‌شد جمع کل همیشه کمتر از عدد واقعی
+            # اپ بیت‌پین باشه.
             for item in wallets:
                 asset = item.get("asset", "")
                 total = float(item.get("balance", 0))
@@ -95,13 +108,21 @@ class PortfolioManager:
                 if total == 0:
                     continue
 
-                balances[asset] = AssetBalance(total=total, available=available, frozen=frozen)
-                asset_balances[asset] = total
+                if asset in balances:
+                    existing = balances[asset]
+                    balances[asset] = AssetBalance(
+                        total=existing.total + total,
+                        available=existing.available + available,
+                        frozen=existing.frozen + frozen,
+                    )
+                else:
+                    balances[asset] = AssetBalance(total=total, available=available, frozen=frozen)
+                asset_balances[asset] = balances[asset].total
 
                 if asset == "IRT":
-                    irit_balance = total
+                    irit_balance = balances[asset].total
                 elif asset == "USDT":
-                    usdt_balance = available
+                    usdt_balance = balances[asset].available
 
             # ... ادامه محاسبه قیمت‌ها و درصدها (بدون تغییر) ...
             usdt_irt_price = self._get_usdt_irt_price()

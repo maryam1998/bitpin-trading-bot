@@ -100,7 +100,8 @@ class ChatHandler:
             if usdt_irt_price <= 0:
                 return "❌ قیمت USDT/IRT در دسترس نیست."
 
-            # ===== اصلاح: محاسبه available از balance - frozen =====
+            # ===== اصلاح: محاسبه available از balance - frozen، و جمع‌کردن
+            # (نه جایگزینی) چند ردیف احتمالی برای یک دارایی =====
             balances = {}
             for item in wallets:
                 asset = item.get("asset", "")
@@ -108,7 +109,12 @@ class ChatHandler:
                 frozen = float(item.get("frozen", 0))
                 # فیلد available واقعاً 0 برمی‌گرداند، پس محاسبه می‌کنیم
                 available = float(item.get("available") or (balance - frozen))
-                if balance > 0:
+                if balance <= 0:
+                    continue
+                if asset in balances:
+                    balances[asset]["balance"] += balance
+                    balances[asset]["available"] += available
+                else:
                     balances[asset] = {"balance": balance, "available": available}
             # ========================================================
 

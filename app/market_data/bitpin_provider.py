@@ -34,8 +34,21 @@ class BitpinProvider(MarketProvider):
         return resp.json()
 
     def get_price(self, symbol: str) -> float:
+        """
+        ===== اصلاح مهم: باگ فرمت نماد =====
+        قبلاً این متد مستقیماً symbol خام (مثلاً "BTC") رو به عنوان پارامتر
+        ticker می‌فرستاد، در حالی که بازارهای بیت‌پین با جفت‌ارز کار می‌کنن
+        (مثلاً "BTC_USDT"). یعنی این تابع همیشه نتیجه‌ی خالی می‌گرفت، همیشه
+        شکست می‌خورد و به provider بعدی (که کندتره) fallback می‌کرد - هم
+        باعث قیمت اشتباه/گمشده می‌شد و هم هر بار یه درخواست شبکه‌ی اضافه و
+        بی‌فایده به بیت‌پین می‌زد که کلاً هدر می‌رفت (یکی از دلایل کندی ربات).
+        """
+        symbol_upper = symbol.upper()
+        if symbol_upper == "USDT":
+            return 1.0
+        market_symbol = f"{symbol_upper}_USDT"
         try:
-            data = self._request("/api/v1/mkt/tickers/", params={"symbol": symbol})
+            data = self._request("/api/v1/mkt/tickers/", params={"symbol": market_symbol})
             if data and isinstance(data, list) and len(data) > 0:
                 return float(data[0].get("price", 0))
             return 0.0
@@ -54,5 +67,5 @@ class BitpinProvider(MarketProvider):
             return {"provider": "bitpin", "error": str(e)}
 
     def supports_symbol(self, symbol: str) -> bool:
-        supported = ["BTC", "ETH", "USDT", "BNB", "XRP", "ADA", "DOGE", "SHIB", "IRT"]
+        supported = ["BTC", "ETH", "USDT", "BNB", "XRP", "ADA", "DOGE", "SHIB"]
         return symbol.upper() in supported
