@@ -28,7 +28,8 @@ class CoinGeckoProvider(MarketProvider):
         mapping = {
             "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
             "XRP": "ripple", "ADA": "cardano", "DOGE": "dogecoin",
-            "SOL": "solana", "DOT": "polkadot", "LINK": "chainlink", "SHIB": "shiba-inu"
+            "SOL": "solana", "DOT": "polkadot", "LINK": "chainlink", "SHIB": "shiba-inu",
+            "TRX": "tron",
         }
         coin_id = mapping.get(symbol.upper())
         if not coin_id:
@@ -47,7 +48,9 @@ class CoinGeckoProvider(MarketProvider):
     def get_historical(self, symbol: str, days: int = 30) -> List[Dict]:
         mapping = {
             "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-            "XRP": "ripple", "ADA": "cardano", "DOGE": "dogecoin"
+            "XRP": "ripple", "ADA": "cardano", "DOGE": "dogecoin",
+            "SOL": "solana", "DOT": "polkadot", "LINK": "chainlink",
+            "SHIB": "shiba-inu", "TRX": "tron",
         }
         coin_id = mapping.get(symbol.upper())
         if not coin_id:
@@ -56,5 +59,5 @@ class CoinGeckoProvider(MarketProvider):
         return [{"time": p[0], "price": p[1]} for p in data.get("prices", [])]
 
     def supports_symbol(self, symbol: str) -> bool:
-        supported = ["BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", "LINK", "SHIB"]
+        supported = ["BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", "LINK", "SHIB", "TRX"]
         return symbol.upper() in supported
