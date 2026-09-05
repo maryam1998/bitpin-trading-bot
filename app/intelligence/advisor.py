@@ -310,6 +310,91 @@ class AIAdvisor:
             ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
         return ticker or {}
 
+    def _tool_get_historical_data(self, symbol: str, days: int = 30) -> Dict[str, Any]:
+        """
+        داده‌ی تاریخی قیمت یک نماد (برای تحلیل روند/محاسبه اندیکاتور توسط AI).
+        این متد قبلاً اصلاً وجود نداشت با اینکه در لیست ابزارها ثبت شده بود -
+        همین باعث می‌شد ساخت AIAdvisor همیشه با AttributeError کرش کند و کل
+        ربات هیچ‌وقت بالا نیاید.
+        """
+        if not self.market_data_manager:
+            return {"error": "market_data_manager not available"}
+        base_symbol = symbol.split("_")[0].upper()
+        history = self.market_data_manager.get_historical(base_symbol, days=days)
+        if not history:
+            return {"error": f"داده‌ی تاریخی برای {symbol} در دسترس نیست", "history": []}
+        return {"symbol": symbol, "days": days, "history": history}
+
+    def _tool_get_technical_indicators(self, symbol: str) -> Dict[str, Any]:
+        """
+        محاسبه‌ی اندیکاتورهای تکنیکال ساده (EMA، RSI، MACD، نوسان/ATR تقریبی)
+        از روی داده‌ی تاریخی واقعی - بدون هیچ کتابخانه‌ی خارجی سنگین.
+        این متد هم قبلاً وجود نداشت (همان باگ کرش‌کننده‌ی بالا).
+        """
+        if not self.market_data_manager:
+            return {"error": "market_data_manager not available"}
+
+        base_symbol = symbol.split("_")[0].upper()
+        history = self.market_data_manager.get_historical(base_symbol, days=30)
+        closes = [p.get("price", 0) for p in history if p.get("price", 0) > 0]
+
+        if len(closes) < 15:
+            return {"error": f"داده‌ی تاریخی کافی برای محاسبه‌ی اندیکاتور {symbol} در دسترس نیست"}
+
+        import numpy as np
+        arr = np.array(closes, dtype=float)
+
+        def ema(values, period):
+            values = np.asarray(values, dtype=float)
+            alpha = 2 / (period + 1)
+            result = np.zeros_like(values)
+            result[0] = values[0]
+            for i in range(1, len(values)):
+                result[i] = alpha * values[i] + (1 - alpha) * result[i - 1]
+            return result
+
+        def rsi(values, period=14):
+            values = np.asarray(values, dtype=float)
+            deltas = np.diff(values)
+            gains = np.where(deltas > 0, deltas, 0.0)
+            losses = np.where(deltas < 0, -deltas, 0.0)
+            if len(gains) < period:
+                period = len(gains)
+            avg_gain = gains[-period:].mean()
+            avg_loss = losses[-period:].mean()
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100 - (100 / (1 + rs))
+
+        ema12 = ema(arr, min(12, len(arr) - 1))
+        ema26 = ema(arr, min(26, len(arr) - 1))
+        macd_line = ema12[-1] - ema26[-1]
+        signal_line = ema(ema12 - ema26, 9)[-1]
+
+        # نوسان تقریبی (شبیه ATR ولی فقط از قیمت بسته‌شدن، چون High/Low نداریم)
+        daily_returns = np.diff(arr) / arr[:-1]
+        volatility_percent = float(np.std(daily_returns) * 100)
+
+        current_rsi = rsi(arr)
+
+        return {
+            "symbol": symbol,
+            "current_price": float(arr[-1]),
+            "ema12": float(ema12[-1]),
+            "ema26": float(ema26[-1]),
+            "rsi_14": round(float(current_rsi), 2),
+            "macd": float(macd_line),
+            "macd_signal": float(signal_line),
+            "volatility_percent": round(volatility_percent, 2),
+            "trend": "صعودی" if ema12[-1] > ema26[-1] else "نزولی",
+            "rsi_note": (
+                "اشباع خرید (احتمال اصلاح)" if current_rsi > 70
+                else "اشباع فروش (احتمال بازگشت)" if current_rsi < 30
+                else "خنثی"
+            ),
+        }
+
     # ===== متدهای چت و یادگیری =====
     def get_recommendation(self, market_data: Dict[str, Any], portfolio: Dict[str, float]) -> str:
         if not self.client:
