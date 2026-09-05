@@ -296,30 +296,7 @@ class ChatHandler:
         lines.append(" ".join(advisor_notes))
 
         lines.append("\n🎯 **بهترین کار الان**")
-        if buy_opps:
-            opp = buy_opps[0]
-            action = "🟢 بررسی خرید"
-            best_move = (
-                f"{cash_ratio:.0f}٪ سرمایه‌ات نقد است. الان یک فرصت احتمالی روی "
-                f"{opp['symbol']} دیده می‌شه ({opp.get('reason', '')}). "
-                f"چون بخش زیادی از سرمایه‌ات نقده، اگه خواستی وارد بشی، بهتره مرحله‌ای باشه، نه یکجا."
-            )
-        elif sell_opps:
-            opp = sell_opps[0]
-            action = "🔴 بررسی برداشت سود"
-            best_move = f"{opp['symbol']} که داری، {opp.get('reason', '')}. شاید وقت خوبی باشه بخشی از سود رو ذخیره کنی."
-        elif cash_ratio >= 50:
-            action = "🟡 صبر"
-            best_move = (
-                f"{cash_ratio:.0f}٪ سرمایه‌ات نقده و الان فرصت خرید به‌اندازه‌ای قوی در بازار دیده نمی‌شه که "
-                "ورود فوری رو توجیه کنه؛ بهتره فعلاً صبر کنیم. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
-            )
-        elif top_volatile_pct >= 50:
-            action = "🔴 کاهش تمرکز"
-            best_move = f"بیشتر سرمایه‌ت روی {top_volatile[0]} متمرکزه؛ بهتره برای کاهش ریسک بخشی از پرتفولیو رو متنوع‌تر کنی."
-        else:
-            action = "🟡 صبر"
-            best_move = "ترکیب فعلی پرتفولیو نسبتاً متعادله؛ فعلاً نیازی به تغییر فوری نیست. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
+        action, best_move = self._decide_best_move(cash_ratio, buy_opps, sell_opps, top_volatile, top_volatile_pct, balances)
         lines.append(f"{action}\n{best_move}")
 
         lines.append("\n⚠️ **ریسک پرتفولیو**")
@@ -331,6 +308,77 @@ class ChatHandler:
 
 
         return "\n".join(lines)
+
+    def _decide_best_move(self, cash_ratio, buy_opps, sell_opps, top_volatile, top_volatile_pct, balances):
+        """
+        ===== اصلاح: «بهترین کار الان» دیگر یک Rule ثابت نیست =====
+        قبلاً این تصمیم فقط از روی درصد نقد بودن سرمایه گرفته می‌شد و اگه
+        نقد بالای ۵۰٪ بود، همیشه و بدون هیچ بررسی واقعی «🟡 صبر» برمی‌گشت.
+        حالا اول از AIAdvisor.decide_best_action می‌خواهیم که با ابزارهای
+        واقعی (Portfolio + Market Data + News + Opportunity Analysis) وضعیت
+        لحظه‌ای بازار را بررسی و تصمیم واقعی بگیرد. اگه فرصت خرید معتبری پیدا
+        بشه، AI می‌تواند 🟢 خرید را پیشنهاد بدهد؛ اگه واقعاً به صبر برسه، باید
+        دلیل واقعی بنویسه.
+
+        اعداد این متد (cash_ratio, top_volatile_pct, opportunities) همه از
+        قبل در پایتون/API محاسبه شده‌اند و فقط به‌عنوان context به AI داده
+        می‌شوند - AI عدد جدید نمی‌سازد.
+
+        اگر AI در دسترس نبود یا نتوانست تصمیم معتبری بدهد، از همان منطق
+        قانون‌محور قبلی (بر پایه‌ی فرصت‌های واقعی از API) به‌عنوان fallback
+        استفاده می‌کنیم تا خروجی هیچ‌وقت خالی/خراب نشود.
+        """
+        if self.advisor is not None:
+            try:
+                context = {
+                    "cash_ratio_percent": round(cash_ratio, 1),
+                    "top_volatile_asset": top_volatile[0] if top_volatile else None,
+                    "top_volatile_asset_percent_of_portfolio": round(top_volatile_pct, 1),
+                    "buy_opportunities": buy_opps,
+                    "sell_opportunities": sell_opps,
+                    "held_assets": list(balances.keys()),
+                }
+                ai_result = self.advisor.decide_best_action(context)
+            except Exception as e:
+                log.warning(f"AI best-action decision failed, using fallback rules: {e}")
+                ai_result = None
+
+            if ai_result:
+                action_display = {
+                    "BUY": "🟢 بررسی خرید",
+                    "SELL": "🔴 بررسی برداشت سود",
+                    "REDUCE_CONCENTRATION": "🔴 کاهش تمرکز",
+                    "WAIT": "🟡 صبر",
+                }.get(ai_result["action"], "🟡 صبر")
+                return action_display, ai_result["reason"]
+
+        # ===== fallback قانون‌محور: فقط وقتی AI در دسترس نباشد یا خطا بدهد =====
+        if buy_opps:
+            opp = buy_opps[0]
+            action = "🟢 بررسی خرید"
+            best_move = (
+                f"حدود {cash_ratio:.0f}٪ سرمایه‌ات در USDT و IRT است و هنوز وارد دارایی‌های پرنوسان نشده‌ای. "
+                f"الان یک فرصت احتمالی روی {opp['symbol']} دیده می‌شه ({opp.get('reason', '')}). "
+                f"چون بخش زیادی از سرمایه‌ات نقده، اگه خواستی وارد بشی، بهتره مرحله‌ای باشه، نه یکجا."
+            )
+        elif sell_opps:
+            opp = sell_opps[0]
+            action = "🔴 بررسی برداشت سود"
+            best_move = f"{opp['symbol']} که داری، {opp.get('reason', '')}. شاید وقت خوبی باشه بخشی از سود رو ذخیره کنی."
+        elif cash_ratio >= 50:
+            action = "🟡 صبر"
+            best_move = (
+                f"حدود {cash_ratio:.0f}٪ سرمایه‌ات در USDT و IRT است و هنوز وارد دارایی‌های پرنوسان نشده‌ای؛ "
+                "الان فرصت خرید به‌اندازه‌ای قوی در بازار دیده نمی‌شه که ورود فوری رو توجیه کنه، بهتره فعلاً "
+                "صبر کنیم. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
+            )
+        elif top_volatile_pct >= 50:
+            action = "🔴 کاهش تمرکز"
+            best_move = f"بیشتر سرمایه‌ت روی {top_volatile[0]} متمرکزه؛ بهتره برای کاهش ریسک بخشی از پرتفولیو رو متنوع‌تر کنی."
+        else:
+            action = "🟡 صبر"
+            best_move = "ترکیب فعلی پرتفولیو نسبتاً متعادله؛ فعلاً نیازی به تغییر فوری نیست. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
+        return action, best_move
 
     def _get_signal(self, symbol: str) -> str:
         if not self.advisor:

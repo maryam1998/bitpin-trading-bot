@@ -12,6 +12,37 @@ SYSTEM_PROMPT_DECISION = """شما یک تحلیلگر بازار هوشمند �
 
 SYSTEM_PROMPT_CHAT = """شما یک مشاور مالی... (بدون تغییر)"""
 
+# ===== اصلاح: تصمیم «بهترین کار الان» دیگر یک Rule ثابت در ChatHandler نیست =====
+# قبلاً اگر بیش از نیمی از سرمایه نقد (USDT/IRT) بود، همیشه و بدون قید و شرط
+# «🟡 صبر» برگردانده می‌شد، حتی اگه همون لحظه یک فرصت خرید واقعی در بازار
+# وجود داشت. این پرامپت به AIAdvisor.decide_best_action داده می‌شود تا واقعاً
+# با ابزارهای Portfolio + Market Data + News + Opportunity Analysis بررسی کند
+# و فقط در صورتی که واقعاً هیچ فرصت معتبری نبود، به WAIT برسد - آن‌هم با یک
+# دلیل واقعی، نه یک جمله‌ی تکراری از پیش نوشته‌شده.
+SYSTEM_PROMPT_BEST_ACTION = """شما یک مشاور معاملاتی هستید که باید مشخص کنید «بهترین کار الان» برای کاربر چیست.
+
+قوانین اجباری:
+1. تصمیم WAIT/«صبر» نباید پیش‌فرض یا قانون ثابت باشد. پیش از رسیدن به هر تصمیمی، حتماً با ابزارهای
+   در دسترس (get_opportunities، get_market_overview، get_technical_indicators، get_news_headlines)
+   وضعیت واقعی بازار را بررسی کن - نه فقط درصدهای ترکیب پرتفولیو که در پیام کاربر آمده.
+2. اگر از این بررسی یک فرصت خرید واقعی به دست آمد (مثلاً از get_opportunities یا اندیکاتورهای فنی)،
+   مجاز و موظفی که اکشن را BUY بگذاری، حتی اگر بخش زیادی از سرمایه نقد (USDT/IRT) باشد.
+3. هرگز هیچ عدد، قیمت، درصد یا تاریخ جدیدی که از طریق ورودی یا خروجی همین ابزارها به تو داده نشده
+   نساز یا حدس نزن؛ فقط از اعدادی که واقعاً در context یا نتیجه‌ی ابزارها آمده استفاده کن.
+4. اگر در نهایت به WAIT رسیدی، در «reason» دلیل مشخص و واقعی بنویس (مثلاً چرا فرصت خرید/فروش معتبری
+   در همین بررسی دیده نشد)، نه یک جمله‌ی کلی و همیشگی.
+5. فقط و فقط یک JSON با دقیقاً همین ساختار خروجی بده و هیچ متن دیگری قبل یا بعد آن ننویس:
+{"action": "BUY" | "SELL" | "REDUCE_CONCENTRATION" | "WAIT", "symbol": "<نماد یا null>", "reason": "<دلیل به فارسی>"}
+"""
+
+# نمادهایی که برای پیدا کردن فرصت روزانه بررسی می‌شوند (همان لیست
+# MarketIntelligence، برای اینکه ابزار get_opportunities این کلاس هم از
+# داده‌ی واقعی و همان معیار استفاده کند - AIAdvisor نمی‌تواند مستقیماً
+# MarketIntelligence را import کند چون آن ماژول خودش AIAdvisor را import
+# می‌کند و این باعث import چرخه‌ای می‌شود).
+OPPORTUNITY_SYMBOLS = ["BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", "LINK", "SHIB"]
+MIN_OPPORTUNITY_CHANGE_PERCENT = 5.0
+
 PROVIDER_BASE_URLS = {
     "openai": None,  # پیش‌فرض OpenAI (base_url رسمی خودش)
     "groq": "https://api.groq.com/openai/v1",
@@ -88,6 +119,8 @@ class AIAdvisor:
             "get_ticker": self._tool_get_ticker,
             "get_technical_indicators": self._tool_get_technical_indicators,
             "get_historical_data": self._tool_get_historical_data,
+            "get_opportunities": self._tool_get_opportunities,
+            "get_news_headlines": self._tool_get_news_headlines,
         }
 
     def decide(self, asset: str, symbol: str) -> Signal:
@@ -193,6 +226,55 @@ class AIAdvisor:
 
     # Fallback حذف شد! هیچ قانون price < 500 یا > 50000 وجود ندارد.
 
+    def decide_best_action(self, portfolio_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        ===== اصلاح: «بهترین کار الان» دیگر یک Rule ثابت در ChatHandler نیست =====
+        به‌جای اینکه صرفاً بر اساس درصد نقد بودن سرمایه (که در portfolio_context
+        محاسبه و پاس داده شده) همیشه به WAIT برسیم، اینجا از AI با دسترسی واقعی
+        به ابزارهای Portfolio + Market Data + News + Opportunity Analysis
+        می‌خواهیم که وضعیت لحظه‌ای بازار را بررسی و تصمیم واقعی بگیرد.
+
+        اعداد/درصدهای ورودی (portfolio_context) و همه‌ی خروجی ابزارها همیشه از
+        API/پایتون می‌آیند؛ از AI فقط یک تصمیم (action) و یک دلیل متنی خواسته
+        می‌شود، نه ساختن عدد جدید.
+
+        اگر AI در دسترس نباشد یا نتواند خروجی معتبر بدهد، None برمی‌گردد تا
+        فراخوان‌کننده (ChatHandler) از منطق fallback قانون‌محور استفاده کند و
+        خروجی هیچ‌وقت خالی/خراب نشود.
+        """
+        if not self.client:
+            return None
+
+        try:
+            user_content = (
+                "این‌ها اعداد واقعی و محاسبه‌شده از API هستند (خودت عدد جدید نساز):\n"
+                + json.dumps(portfolio_context, ensure_ascii=False, default=str)
+                + "\n\nبا استفاده از ابزارهای در دسترس (بخصوص get_opportunities، get_market_overview و "
+                  "در صورت امکان get_news_headlines)، وضعیت واقعی بازار را بررسی کن و طبق قوانین سیستم "
+                  "تصمیم بگیر که الان بهترین کار برای کاربر چیست."
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_BEST_ACTION},
+                {"role": "user", "content": user_content},
+            ]
+            result = self._run_decision_tools(messages)
+
+            # این دو مقدار فقط زمانی برگردانده می‌شوند که AI اصلاً نتوانسته
+            # پاسخ معتبر بدهد (خطا/تمام‌شدن iteration‌ها) - این‌ها تصمیم واقعی
+            # نیستند و نباید به کاربر نشان داده شوند؛ باید fallback فعال شود.
+            if result.get("reason") in {"No valid JSON", "Max iterations exceeded"}:
+                return None
+
+            action = result.get("action")
+            reason = result.get("reason")
+            if action not in {"BUY", "SELL", "REDUCE_CONCENTRATION", "WAIT"} or not reason:
+                return None
+
+            return {"action": action, "symbol": result.get("symbol"), "reason": reason}
+        except Exception as e:
+            log.error(f"AI best-action decision error: {e}")
+            return None
+
     # ===== ابزارها =====
     def _build_tool_specs(self) -> List[Dict[str, Any]]:
         return [
@@ -269,6 +351,27 @@ class AIAdvisor:
                             "days": {"type": "integer", "description": "تعداد روز", "default": 30}
                         },
                         "required": ["symbol"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_opportunities",
+                    "description": "دریافت فرصت‌های واقعی معاملاتی (خرید/فروش) بر اساس تغییر قیمت واقعی ۲۴ ساعته و دارایی‌های فعلی کاربر",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_news_headlines",
+                    "description": "دریافت عناوین اخبار اقتصادی/کریپتو اخیر از منابع RSS معتبر",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "description": "حداکثر تعداد خبر", "default": 6}
+                        },
                     },
                 },
             },
@@ -404,6 +507,86 @@ class AIAdvisor:
                 else "خنثی"
             ),
         }
+
+    def _tool_get_opportunities(self) -> Dict[str, Any]:
+        """
+        فرصت‌های واقعی بازار بر اساس درصد تغییر قیمت واقعی ۲۴ ساعته (همان
+        معیار MarketIntelligence._find_opportunities) - برای اینکه تصمیم
+        «بهترین کار الان» بتواند واقعاً به یک فرصت خرید/فروش واقعی برسد، نه
+        فقط ترکیب درصدی پرتفولیو. اعداد همگی از get_all_prices/get_historical
+        واقعی می‌آیند؛ چیزی اینجا ساخته نمی‌شود.
+        """
+        if not self.market_data_manager:
+            return {"error": "market_data_manager not available"}
+        try:
+            prices = self.market_data_manager.get_all_prices(symbols=OPPORTUNITY_SYMBOLS)
+        except Exception as e:
+            return {"error": str(e)}
+
+        portfolio_amounts: Dict[str, float] = {}
+        if self.portfolio_manager:
+            try:
+                snap = self.portfolio_manager.fetch_snapshot()
+                portfolio_amounts = {a: bal.total for a, bal in snap.balances.items()}
+            except Exception:
+                portfolio_amounts = {}
+
+        opportunities = []
+        for symbol in OPPORTUNITY_SYMBOLS:
+            price = prices.get(symbol)
+            if not price or price <= 0:
+                continue
+            try:
+                history = self.market_data_manager.get_historical(symbol, days=1)
+            except Exception:
+                history = None
+            if not history or len(history) < 2:
+                continue
+            first_price = history[0].get("price", 0)
+            last_price = history[-1].get("price", 0)
+            if first_price <= 0:
+                continue
+            change = ((last_price - first_price) / first_price) * 100
+            holding = portfolio_amounts.get(symbol, 0) or 0
+
+            if change <= -MIN_OPPORTUNITY_CHANGE_PERCENT:
+                opportunities.append({
+                    "symbol": symbol,
+                    "action": "BUY",
+                    "price": price,
+                    "change_percent_24h": round(change, 2),
+                    "reason": f"در ۲۴ ساعت اخیر {change:.1f}% افت کرده",
+                })
+            elif change >= MIN_OPPORTUNITY_CHANGE_PERCENT and holding > 0:
+                opportunities.append({
+                    "symbol": symbol,
+                    "action": "SELL",
+                    "price": price,
+                    "change_percent_24h": round(change, 2),
+                    "reason": f"در ۲۴ ساعت اخیر {change:.1f}% رشد کرده و شما این دارایی را دارید",
+                })
+
+        return {"opportunities": opportunities}
+
+    def _tool_get_news_headlines(self, limit: int = 6) -> Dict[str, Any]:
+        """
+        عناوین اخبار اقتصادی/کریپتو واقعی از RSS (NewsFetcher) تا تصمیم
+        «بهترین کار الان» صرفاً بر اساس اعداد پرتفولیو نباشد. اگر شبکه/RSS
+        در دسترس نبود، خطا برمی‌گردد تا AI بداند نتوانسته اخبار را چک کند
+        (نه اینکه فرض کند خبر بدی وجود ندارد).
+        """
+        try:
+            from app.forecast.news_fetcher import NewsFetcher
+            articles = NewsFetcher().fetch_all(limit_per_source=2)
+            headlines = [
+                {"title": a.get("title", ""), "source": a.get("source", "")}
+                for a in articles if a.get("title")
+            ][:max(1, limit)]
+            if not headlines:
+                return {"headlines": [], "note": "خبر معتبری در دسترس نبود"}
+            return {"headlines": headlines}
+        except Exception as e:
+            return {"error": str(e)}
 
     # ===== متدهای چت و یادگیری =====
     def get_recommendation(self, market_data: Dict[str, Any], portfolio: Dict[str, float]) -> str:
