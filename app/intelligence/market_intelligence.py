@@ -83,6 +83,19 @@ class MarketIntelligence:
             log.debug(f"No 24h change available for {symbol}: {e}")
             return None
 
+    def get_opportunities(self, portfolio: Dict[str, float]) -> List[Dict]:
+        """
+        نسخه‌ی سبک برای گرفتن فرصت‌های واقعی بازار بدون فراخوانی AI advisor -
+        برای استفاده در گزارش کیف پول (که فقط به لیست فرصت‌ها نیاز داره، نه
+        یک تحلیل متنی کامل که هزینه/تاخیر اضافه ایجاد کنه).
+        """
+        try:
+            prices = self.market_manager.get_all_prices()
+            return self._find_opportunities(prices, portfolio)
+        except Exception as e:
+            log.warning(f"get_opportunities failed: {e}")
+            return []
+
     def _find_opportunities(self, prices: Dict[str, float], portfolio: Dict[str, float]) -> List[Dict]:
         """
         فرصت‌ها بر اساس درصد واقعیِ تغییر قیمت در ۲۴ ساعت اخیر مشخص می‌شوند،

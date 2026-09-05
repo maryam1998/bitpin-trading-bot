@@ -213,6 +213,10 @@ class ChatHandler:
         volatile = [(a, v) for a, v in asset_values_irt.items() if a not in self._STABLE_ASSETS]
         top_volatile = max(volatile, key=lambda kv: kv[1]) if volatile else None
         top_volatile_pct = (top_volatile[1] / total_irt * 100) if (top_volatile and total_irt > 0) else 0.0
+        # بزرگ‌ترین دارایی به‌طور مطلق (شامل نقد) - این چیزیه که واقعاً باید
+        # به عنوان «بیشترین تمرکز» گزارش بشه، نه فقط بزرگ‌ترین رمزارز
+        largest_overall = max(asset_values_irt.items(), key=lambda kv: kv[1]) if asset_values_irt else None
+        largest_overall_pct = (largest_overall[1] / total_irt * 100) if (largest_overall and total_irt > 0) else 0.0
 
         if cash_ratio >= 50:
             liquidity = "🟢 خوب"
@@ -221,9 +225,13 @@ class ChatHandler:
         else:
             liquidity = "🔴 پایین"
 
-        if top_volatile_pct >= 50:
-            diversity = "🔴 پایین (تمرکز زیاد روی یک دارایی)"
-        elif top_volatile_pct >= 25:
+        # ===== اصلاح: تنوع باید هم به تمرکز نقد و هم به تمرکز درون رمزارزها توجه کنه =====
+        # قبلاً فقط بر اساس سهم بزرگ‌ترین رمزارز از کل پرتفولیو حساب می‌شد؛
+        # وقتی اکثر پول نقده، این عدد ذاتاً کوچیک می‌موند و همیشه «خوب» می‌داد،
+        # حتی وقتی ۸۵٪ سرمایه فقط توی ۲ نوع دارایی (USDT/IRT) بود.
+        if cash_ratio >= 90 or top_volatile_pct >= 50:
+            diversity = "🔴 پایین"
+        elif cash_ratio >= 70 or top_volatile_pct >= 25:
             diversity = "🟡 متوسط"
         else:
             diversity = "🟢 خوب"
@@ -236,25 +244,59 @@ class ChatHandler:
         else:
             risk_level = "🟢 پایین"
 
+        # ===== اصلاح: نگاه به فرصت‌های واقعی بازار، نه فقط ترکیب پرتفولیو =====
+        # قبلاً تصمیم فقط از روی درصد نقد بودن سرمایه گرفته می‌شد و همیشه
+        # «صبر» می‌گفت، حتی اگه همون لحظه یه فرصت واقعی توی بازار بود.
+        opportunities = []
+        if self.engine is not None:
+            try:
+                portfolio_amounts = {a: balances[a]["balance"] for a in balances}
+                opportunities = self.engine.get_opportunities(portfolio_amounts)
+            except Exception as e:
+                log.warning(f"opportunity check failed in portfolio report: {e}")
+
+        buy_opps = [o for o in opportunities if o.get("action") == "BUY"]
+        sell_opps = [o for o in opportunities if o.get("action") == "SELL" and o.get("symbol") in asset_values_irt]
+
         lines.append("\n━━━━━━━━━━━━")
         lines.append("🧠 **نظر مشاور**")
         advisor_notes = []
-        advisor_notes.append(f"حدود {cash_ratio:.0f}٪ از سرمایه‌ت به‌صورت نقد (USDT/تومان) هست.")
-        if top_volatile:
-            advisor_notes.append(f"بیشترین تمرکز روی {top_volatile[0]} با حدود {top_volatile_pct:.0f}٪ از کل پرتفولیوئه.")
+        if largest_overall:
+            cash_note = f"بیشترین بخش سرمایه‌ات در {largest_overall[0]}"
+            other_stable = [a for a in self._STABLE_ASSETS if a in asset_values_irt and a != largest_overall[0]]
+            if largest_overall[0] in self._STABLE_ASSETS and other_stable:
+                cash_note += f" و {other_stable[0]} قرار دارد و حدود {cash_ratio:.0f}٪ کل سرمایه را تشکیل می‌دهد."
+            else:
+                cash_note += f" قرار دارد و حدود {largest_overall_pct:.0f}٪ کل سرمایه را تشکیل می‌دهد."
+            advisor_notes.append(cash_note)
         advisor_notes.append(f"سطح ریسک فعلی پرتفولیو: {risk_level.split()[-1]}.")
         lines.append(" ".join(advisor_notes))
 
         lines.append("\n🎯 **بهترین کار الان**")
-        if cash_ratio >= 50:
+        if buy_opps:
+            opp = buy_opps[0]
+            action = "🟢 بررسی خرید"
+            best_move = (
+                f"{cash_ratio:.0f}٪ سرمایه‌ات نقد است. الان یک فرصت احتمالی روی "
+                f"{opp['symbol']} دیده می‌شه ({opp.get('reason', '')}). "
+                f"چون بخش زیادی از سرمایه‌ات نقده، اگه خواستی وارد بشی، بهتره مرحله‌ای باشه، نه یکجا."
+            )
+        elif sell_opps:
+            opp = sell_opps[0]
+            action = "🔴 بررسی برداشت سود"
+            best_move = f"{opp['symbol']} که داری، {opp.get('reason', '')}. شاید وقت خوبی باشه بخشی از سود رو ذخیره کنی."
+        elif cash_ratio >= 50:
             action = "🟡 صبر"
-            best_move = "بخش زیادی از سرمایه‌ت نقده، پس عجله‌ای برای خرید نیست؛ صبر کن یه فرصت واقعی (با /opportunities) پیدا بشه، بعد مرحله‌ای وارد شو."
+            best_move = (
+                f"{cash_ratio:.0f}٪ سرمایه‌ات نقده و الان فرصت خرید به‌اندازه‌ای قوی در بازار دیده نمی‌شه که "
+                "ورود فوری رو توجیه کنه؛ بهتره فعلاً صبر کنیم. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
+            )
         elif top_volatile_pct >= 50:
             action = "🔴 کاهش تمرکز"
             best_move = f"بیشتر سرمایه‌ت روی {top_volatile[0]} متمرکزه؛ بهتره برای کاهش ریسک بخشی از پرتفولیو رو متنوع‌تر کنی."
         else:
             action = "🟡 صبر"
-            best_move = "ترکیب فعلی پرتفولیو نسبتاً متعادله؛ فعلاً نیازی به تغییر فوری نیست."
+            best_move = "ترکیب فعلی پرتفولیو نسبتاً متعادله؛ فعلاً نیازی به تغییر فوری نیست. اگه فرصت مناسبی پیش بیاد، بهت خبر می‌دم."
         lines.append(f"{action}\n{best_move}")
 
         lines.append("\n⚠️ **ریسک پرتفولیو**")
@@ -262,7 +304,8 @@ class ChatHandler:
         lines.append(f"{diversity.split()[0]} تنوع: {' '.join(diversity.split()[1:])}")
         lines.append(f"{risk_level.split()[0]} ریسک فعلی: {risk_level.split()[1]}")
 
-        lines.append("\n💡 این یک تحلیل بر اساس ترکیب دارایی‌های توئه، نه پیش‌بینی بازار. برای سیگنال لحظه‌ای بازار، دستور /opportunities رو بزن.")
+        lines.append("\n💡 این تحلیل ترکیب دو چیزه: دارایی‌های خودت و وضعیت لحظه‌ای بازار - نه فقط حدس. تضمینی در کار نیست، فقط راهنماییه.")
+
 
         return "\n".join(lines)
 
