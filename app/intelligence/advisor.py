@@ -96,6 +96,25 @@ BUY_DECISION_JSON_SCHEMA = {
     "strict": True,
 }
 
+# ===== اصلاح ریشه‌ای (رفع متن تکراری «صبر» در «موجودی»/«کیف پول»): =====
+# schema خروجی برای decide_best_action - دقیقاً هم‌ساختار BUY_DECISION_JSON_SCHEMA
+# ولی با action های SELL/REDUCE_CONCENTRATION/WAIT هم (نه فقط BUY/SELL/WAIT) و
+# بدون confidence (این تصمیم قبلاً هم confidence نمی‌داد؛ رفتار حفظ شده).
+BEST_ACTION_JSON_SCHEMA = {
+    "name": "best_action_decision",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["BUY", "SELL", "REDUCE_CONCENTRATION", "WAIT"]},
+            "symbol": {"type": ["string", "null"]},
+            "reason": {"type": "string"},
+        },
+        "required": ["action", "symbol", "reason"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
 
 class _StateCache:
     """
@@ -163,26 +182,48 @@ SYSTEM_PROMPT_CHAT = """شما یک مشاور مالی و معاملاتی هس
 4. اگر یک ابزار خطا داد یا داده‌ای برنگرداند، این را صریح به کاربر بگو؛ وانمود نکن تحلیل انجام شده.
 """
 
-# ===== اصلاح: تصمیم «بهترین کار الان» دیگر یک Rule ثابت در ChatHandler نیست =====
-# قبلاً اگر بیش از نیمی از سرمایه نقد (USDT/IRT) بود، همیشه و بدون قید و شرط
-# «🟡 صبر» برگردانده می‌شد، حتی اگه همون لحظه یک فرصت خرید واقعی در بازار
-# وجود داشت. این پرامپت به AIAdvisor.decide_best_action داده می‌شود تا واقعاً
-# با ابزارهای Portfolio + Market Data + News + Opportunity Analysis بررسی کند
-# و فقط در صورتی که واقعاً هیچ فرصت معتبری نبود، به WAIT برسد - آن‌هم با یک
-# دلیل واقعی، نه یک جمله‌ی تکراری از پیش نوشته‌شده.
+# ===== اصلاح ریشه‌ای دوم (رفع متن تکراری «صبر» در «موجودی»/«کیف پول»): =====
+# نسخه‌ی قبلی این پرامپت از مدل می‌خواست خودش با صدا زدن چند ابزار جدا
+# (get_opportunities، get_market_overview، get_technical_indicators،
+# get_news_headlines) به تصمیم برسد (معماری Tool-Calling، از طریق
+# _run_decision_tools). مشکل این بود: رسیدن به یک تصمیم نهایی معمولاً به
+# ۴ یا ۵ round-trip نیاز داشت (هر ابزار یک iteration + یک iteration برای
+# پاسخ نهایی)، درحالی‌که سقف AI_MAX_TOOL_ITERATIONS (پیش‌فرض ۳) اجازه‌ی
+# این را نمی‌داد. نتیجه: تقریباً هر بار "Max iterations exceeded"،
+# decide_best_action همیشه None برمی‌گرداند، و ChatHandler._decide_best_move
+# همیشه به fallback قانون‌محور ثابت (همان متن تکراری «حدود X٪ در USDT/IRT
+# ... فعلاً صبر کنیم») سقوط می‌کرد - نه به این خاطر که AI واقعاً به WAIT
+# می‌رسید، بلکه چون تحلیل اصلاً به پایان نمی‌رسید.
+#
+# حالا (دقیقاً هم‌معماری با SYSTEM_PROMPT_BUY_DECISION/decide_buy_recommendation)
+# دیگر از مدل خواسته نمی‌شود ابزاری صدا بزند: decide_best_action خودش
+# get_market_comparison()/get_news() را در پایتون واقعی صدا می‌زند و نتیجه
+# را مستقیماً در پیام کاربر به مدل می‌دهد. یعنی صفر خطر Max-iterations، و
+# هر بار داده‌ی Market+News+Opportunity کاملاً تازه است.
 SYSTEM_PROMPT_BEST_ACTION = """شما یک مشاور معاملاتی هستید که باید مشخص کنید «بهترین کار الان» برای کاربر چیست.
+به شما در پیام کاربر سه بخش داده‌ی واقعی داده می‌شود که همین الان از API/پایتون جمع شده‌اند:
+- portfolio: وضعیت واقعی پرتفولیو (درصد نقد، دارایی‌های نگه‌داری‌شده و ...)
+- market_candidates: مقایسه‌ی چند دارایی واقعی بازار با قیمت لحظه‌ای و درصد تغییر ۲۴ ساعته
+- news_headlines: عناوین اخبار اقتصادی/کریپتو اخیر (ممکن است خالی باشد)
 
 قوانین اجباری:
-1. تصمیم WAIT/«صبر» نباید پیش‌فرض یا قانون ثابت باشد. پیش از رسیدن به هر تصمیمی، حتماً با ابزارهای
-   در دسترس (get_opportunities، get_market_overview، get_technical_indicators، get_news_headlines)
-   وضعیت واقعی بازار را بررسی کن - نه فقط درصدهای ترکیب پرتفولیو که در پیام کاربر آمده.
-2. اگر از این بررسی یک فرصت خرید واقعی به دست آمد (مثلاً از get_opportunities یا اندیکاتورهای فنی)،
-   مجاز و موظفی که اکشن را BUY بگذاری، حتی اگر بخش زیادی از سرمایه نقد (USDT/IRT) باشد.
-3. هرگز هیچ عدد، قیمت، درصد یا تاریخ جدیدی که از طریق ورودی یا خروجی همین ابزارها به تو داده نشده
-   نساز یا حدس نزن؛ فقط از اعدادی که واقعاً در context یا نتیجه‌ی ابزارها آمده استفاده کن.
-4. اگر در نهایت به WAIT رسیدی، در «reason» دلیل مشخص و واقعی بنویس (مثلاً چرا فرصت خرید/فروش معتبری
-   در همین بررسی دیده نشد)، نه یک جمله‌ی کلی و همیشگی.
-5. فقط و فقط یک JSON با دقیقاً همین ساختار خروجی بده و هیچ متن دیگری قبل یا بعد آن ننویس:
+1. تصمیم WAIT/«صبر» نباید پیش‌فرض یا قانون ثابت باشد و نباید صرفاً از روی درصد نقد بودن پرتفولیو
+   گرفته شود. باید واقعاً market_candidates و news_headlines را با هم مقایسه کنی.
+2. اگر یکی از market_candidates واقعاً افت قیمت قابل‌توجه نشان داد (is_opportunity=true, action=BUY)،
+   مجاز و موظفی که action=BUY را با همان symbol برگردانی، حتی اگر بخش زیادی از سرمایه نقد (USDT/IRT)
+   باشد.
+3. اگر یکی از دارایی‌های نگه‌داری‌شده‌ی کاربر (portfolio.held_assets) رشد قابل‌توجه نشان داد
+   (is_opportunity=true, action=SELL)، مجازی action=SELL بدهی.
+4. اگر یک دارایی نگه‌داری‌شده بخش نامتناسب زیادی از کل پرتفولیو را تشکیل داده (تمرکز بالا)، می‌توانی
+   action=REDUCE_CONCENTRATION با همان symbol بدهی.
+5. symbol فقط می‌تواند یکی از نمادهای موجود در market_candidates یا portfolio.held_assets باشد؛ هرگز
+   نماد یا عددی که در ورودی نیامده نساز یا حدس نزن. اگر action=WAIT بود، symbol باید null باشد.
+6. اگر در نهایت به WAIT رسیدی، در «reason» دقیقاً بگو چرا هیچ‌کدام از market_candidates/news فرصت
+   معتبری نشان ندادند (با اشاره به درصد تغییر واقعی‌شان)، نه یک جمله‌ی کلی و همیشگی.
+7. هرگز هیچ عدد، قیمت یا درصدی که در همین context نیامده نساز یا حدس نزن.
+8. اگر داده‌ی جدید (market_candidates/news) نسبت به قبل واقعاً فرقی نکرده، نتیجه‌ی مشابه مجاز است؛
+   ولی اگر فرق کرده، تصمیم و دلیل هم باید همان تغییر واقعی را منعکس کند.
+9. فقط و فقط یک JSON با دقیقاً همین ساختار خروجی بده و هیچ متن دیگری (و بدون ```json) قبل یا بعد آن:
 {"action": "BUY" | "SELL" | "REDUCE_CONCENTRATION" | "WAIT", "symbol": "<نماد یا null>", "reason": "<دلیل به فارسی>"}
 """
 
@@ -558,15 +599,28 @@ class AIAdvisor:
 
     def decide_best_action(self, portfolio_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        ===== اصلاح: «بهترین کار الان» دیگر یک Rule ثابت در ChatHandler نیست =====
-        به‌جای اینکه صرفاً بر اساس درصد نقد بودن سرمایه (که در portfolio_context
-        محاسبه و پاس داده شده) همیشه به WAIT برسیم، اینجا از AI با دسترسی واقعی
-        به ابزارهای Portfolio + Market Data + News + Opportunity Analysis
-        می‌خواهیم که وضعیت لحظه‌ای بازار را بررسی و تصمیم واقعی بگیرد.
+        ===== اصلاح ریشه‌ای دوم (رفع متن تکراری «صبر» در «موجودی»/«کیف پول»): =====
+        نسخه‌ی قبلی این متد با _run_decision_tools (حلقه‌ی Tool-Calling، سقف
+        AI_MAX_TOOL_ITERATIONS پیش‌فرض ۳) کار می‌کرد و از مدل می‌خواست خودش
+        چند ابزار (get_opportunities، get_market_overview، get_news_headlines)
+        را جدا صدا بزند. چون رسیدن به پاسخ نهایی معمولاً به بیش از ۳ round-trip
+        نیاز داشت، این متد تقریباً همیشه با "Max iterations exceeded" مواجه
+        می‌شد، None برمی‌گرداند، و ChatHandler._decide_best_move همیشه به
+        fallback قانون‌محور ثابت سقوط می‌کرد - همان متن تکراری «حدود X٪ در
+        USDT/IRT ... فعلاً صبر کنیم» که واقعاً تحلیل بازار نبود.
 
-        اعداد/درصدهای ورودی (portfolio_context) و همه‌ی خروجی ابزارها همیشه از
-        API/پایتون می‌آیند؛ از AI فقط یک تصمیم (action) و یک دلیل متنی خواسته
-        می‌شود، نه ساختن عدد جدید.
+        حالا (دقیقاً هم‌معماری با decide_buy_recommendation): خودمان
+        get_market_comparison()/get_news() را همین‌جا در پایتون واقعی صدا
+        می‌زنیم (بدون اینکه به مدل اجازه/نیاز صدا زدن ابزار بدهیم) و نتیجه‌ی
+        تازه را به‌عنوان context در یک تماس deterministic و تک‌مرحله‌ای به
+        مدل می‌دهیم. یعنی صفر خطر Max-iterations، و هر بار Market + News +
+        Opportunity واقعاً تازه بررسی می‌شود - نه فقط درصدهای پرتفولیو.
+
+        portfolio_context (cash_ratio_percent، held_assets، buy/sell
+        opportunities از موتور فرصت‌یابی ChatHandler و ...) از قبل در
+        پایتون محاسبه شده و بدون تغییر به AI داده می‌شود - AI عدد جدید
+        نمی‌سازد، فقط از این اعداد + market_candidates/news_headlines تازه
+        تحلیل و تصمیم می‌گیرد.
 
         اگر AI در دسترس نباشد یا نتواند خروجی معتبر بدهد، None برمی‌گردد تا
         فراخوان‌کننده (ChatHandler) از منطق fallback قانون‌محور استفاده کند و
@@ -575,45 +629,104 @@ class AIAdvisor:
         if not self.client:
             return None
 
+        # ----- داده‌ی واقعی و تازه‌ی Market + Opportunity (بدون دخالت مدل) -----
+        try:
+            comparison = self.get_market_comparison()
+        except Exception as e:
+            log.warning(f"decide_best_action: get_market_comparison failed: {e}")
+            comparison = {"candidates": []}
+        candidates_raw = comparison.get("candidates", []) if isinstance(comparison, dict) else []
+
+        # ----- داده‌ی واقعی و تازه‌ی اخبار -----
+        try:
+            news = self.get_news(limit=4)
+        except Exception as e:
+            log.warning(f"decide_best_action: get_news failed: {e}")
+            news = {}
+
+        compact_candidates = [
+            {k: c[k] for k in ("symbol", "price", "change_percent_24h", "is_opportunity", "action", "reason")
+             if k in c}
+            for c in candidates_raw
+        ]
+        compact_news = [h.get("title", "") for h in news.get("headlines", [])[:3]] if isinstance(news, dict) else []
+
+        # symbol خروجی مدل باید یا یکی از market_candidates باشد (برای BUY)،
+        # یا یکی از دارایی‌های واقعاً نگه‌داری‌شده (برای SELL/REDUCE_CONCENTRATION)
+        candidate_symbols = {c.get("symbol") for c in candidates_raw if c.get("symbol")}
+        held_assets = {a for a in (portfolio_context.get("held_assets") or [])}
+        allowed_symbols = candidate_symbols | held_assets
+
+        compact_context = {
+            "portfolio": portfolio_context,
+            "market_candidates": compact_candidates,
+            "news_headlines": compact_news,
+        }
+
         # ===== اصلاح مصرف توکن: cache بر اساس state واقعی =====
-        # اگر cash_ratio/opportunities/held_assets نسبت به آخرین بار عوض
-        # نشده باشد (مثلاً کاربر چند بار پشت‌سرهم «موجودی» را می‌پرسد)، به‌جای
-        # صدا زدن دوباره‌ی LLM همان تصمیم قبلی (که هنوز هم صحیح است) برگردانده
-        # می‌شود. به محض تغییر واقعی این عددها، cache خودکار باطل می‌شود.
-        cached = self._decision_cache.get("best_action", portfolio_context, self.decision_cache_seconds)
+        # کلید cache از portfolio_context + market_candidates/news تازه ساخته
+        # می‌شود (نه فقط portfolio_context قدیمی) تا با هر تغییر واقعی در
+        # بازار/اخبار، حتی اگر ترکیب پرتفولیو عوض نشده باشد، cache باطل شود.
+        cache_key_context = {"portfolio_context": portfolio_context, "market_candidates": compact_candidates,
+                              "news_headlines": compact_news}
+        cached = self._decision_cache.get("best_action", cache_key_context, self.decision_cache_seconds)
         if cached is not None:
             return cached
 
         try:
             user_content = (
-                "این‌ها اعداد واقعی و محاسبه‌شده از API هستند (خودت عدد جدید نساز):\n"
-                + json.dumps(portfolio_context, ensure_ascii=False, default=str)
-                + "\n\nبا استفاده از ابزارهای در دسترس (بخصوص get_opportunities، get_market_overview و "
-                  "در صورت امکان get_news_headlines)، وضعیت واقعی بازار را بررسی کن و طبق قوانین سیستم "
-                  "تصمیم بگیر که الان بهترین کار برای کاربر چیست."
+                "این‌ها داده‌ی واقعی هستند که همین الان از API/پایتون جمع شده‌اند (خودت عدد جدید نساز):\n"
+                + json.dumps(compact_context, ensure_ascii=False, default=str)
+                + "\n\nبا مقایسه‌ی وضعیت پرتفولیو، همه‌ی market_candidates، و news_headlines، طبق قوانین "
+                  "سیستم تصمیم بگیر که الان بهترین کار برای کاربر چیست."
             )
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT_BEST_ACTION},
                 {"role": "user", "content": user_content},
             ]
-            # ===== اصلاح مصرف توکن: این تصمیم دیگر «تحلیل پیچیده» نیست
-            # (چون cash_ratio/opportunities از قبل در پایتون آماده شده‌اند)،
-            # پس از مدل سریع/ارزان استفاده می‌شود، نه gpt-oss-120b. =====
-            result = self._run_decision_tools(messages, node="best_action", model=self.fast_model)
+            # ===== اصلاح مصرف توکن: این تصمیم «تحلیل پیچیده» نیست (چون همه‌ی
+            # داده‌ی لازم از قبل در پایتون آماده شده)، پس از مدل سریع/ارزان
+            # استفاده می‌شود، نه gpt-oss-120b. بدون tools = بدون خطر
+            # Max-iterations. =====
+            response = self._call_llm(
+                node="best_action", model=self.fast_model,
+                messages=messages, temperature=0.3, max_tokens=500,
+                response_format={"type": "json_schema", "json_schema": BEST_ACTION_JSON_SCHEMA},
+            )
+            if response is None:
+                return None
 
-            # این دو مقدار فقط زمانی برگردانده می‌شوند که AI اصلاً نتوانسته
-            # پاسخ معتبر بدهد (خطا/تمام‌شدن iteration‌ها) - این‌ها تصمیم واقعی
-            # نیستند و نباید به کاربر نشان داده شوند؛ باید fallback فعال شود.
-            if result.get("reason") in {"No valid JSON", "Max iterations exceeded", "AI rate-limited or unavailable"}:
+            raw_content = response.choices[0].message.content or ""
+            json_text = _extract_json_object(raw_content)
+            if not json_text:
+                log.warning(f"decide_best_action: no JSON object found in output: {raw_content[:300]!r}")
+                return None
+            try:
+                result = json.loads(json_text)
+            except json.JSONDecodeError as e:
+                log.warning(f"decide_best_action: JSON decode failed: {e}")
                 return None
 
             action = result.get("action")
             reason = result.get("reason")
-            if action not in {"BUY", "SELL", "REDUCE_CONCENTRATION", "WAIT"} or not reason:
+            raw_symbol = result.get("symbol")
+
+            if action not in {"BUY", "SELL", "REDUCE_CONCENTRATION", "WAIT"} or not reason or not isinstance(reason, str):
+                log.warning(f"decide_best_action: invalid AI output {result!r}")
                 return None
 
-            final = {"action": action, "symbol": result.get("symbol"), "reason": reason}
-            self._decision_cache.set("best_action", portfolio_context, final)
+            symbol = None
+            if action in {"BUY", "SELL", "REDUCE_CONCENTRATION"}:
+                symbol = _normalize_symbol(raw_symbol, allowed_symbols)
+                if not symbol:
+                    log.warning(
+                        f"decide_best_action: symbol {raw_symbol!r} پس از normalize در نمادهای مجاز "
+                        f"{sorted(allowed_symbols)} نیست - تصمیم رد شد"
+                    )
+                    return None
+
+            final = {"action": action, "symbol": symbol, "reason": reason}
+            self._decision_cache.set("best_action", cache_key_context, final)
             return final
         except Exception as e:
             log.error(f"AI best-action decision error: {e}")
