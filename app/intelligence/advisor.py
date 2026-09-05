@@ -263,19 +263,35 @@ class AIAdvisor:
             # کاملاً حذف شده (decommissioned) و دیگر جواب نمی‌دهد (404) =====
             groq_deprecated_models = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant",
                                        "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct"}
-            if provider == "groq" and settings.ai_model.lower().startswith("gpt-"):
-                log.warning(
-                    f"⚠️ مدل {settings.ai_model!r} مخصوص OpenAI است و روی Groq کار نمی‌کند. "
-                    "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد. "
-                    "برای انتخاب مدل دیگر، AI_MODEL را در تنظیمات Groq مطابق مستندات Groq ست کنید."
-                )
-                settings.ai_model = "openai/gpt-oss-120b"
-            elif provider == "groq" and settings.ai_model in groq_deprecated_models:
-                log.warning(
-                    f"⚠️ مدل {settings.ai_model!r} توسط Groq حذف شده (decommissioned). "
-                    "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد."
-                )
-                settings.ai_model = "openai/gpt-oss-120b"
+
+            # ===== اصلاح ریشه‌ای: همین auto-correct باید روی AI_MODEL_FAST هم اجرا شود =====
+            # قبلاً فقط settings.ai_model تصحیح می‌شد. اما decide_buy_recommendation
+            # (فلوی «چی بخرم؟»)، decide_best_action، و چت آزاد همیشه از self.fast_model
+            # (= settings.ai_model_fast یا در نبودش settings.ai_model) استفاده می‌کنند.
+            # اگر AI_MODEL_FAST به یک مدل gpt-* یا یک مدل حذف‌شده‌ی Groq ست شده باشد،
+            # این مسیرها همیشه با خطای «مدل نامعتبر» (400/404) شکست می‌خوردند - قبل از
+            # اینکه اصلاً پاسخی از مدل بگیریم - بدون اینکه هیچ اصلاحی مثل مسیر
+            # ai_model روی آن اعمال شود.
+            def _autocorrect_model(name: str, label: str) -> str:
+                if provider != "groq" or not name:
+                    return name
+                if name.lower().startswith("gpt-"):
+                    log.warning(
+                        f"⚠️ {label}={name!r} مخصوص OpenAI است و روی Groq کار نمی‌کند. "
+                        "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد. "
+                        f"برای انتخاب مدل دیگر، {label} را در تنظیمات Groq مطابق مستندات Groq ست کنید."
+                    )
+                    return "openai/gpt-oss-120b"
+                if name in groq_deprecated_models:
+                    log.warning(
+                        f"⚠️ {label}={name!r} توسط Groq حذف شده (decommissioned). "
+                        "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد."
+                    )
+                    return "openai/gpt-oss-120b"
+                return name
+
+            settings.ai_model = _autocorrect_model(settings.ai_model, "AI_MODEL")
+            settings.ai_model_fast = _autocorrect_model(settings.ai_model_fast, "AI_MODEL_FAST")
 
             try:
                 # ===== اصلاح: max_retries=0 =====
@@ -383,32 +399,56 @@ class AIAdvisor:
                 )
                 continue
             except APIStatusError as e:
-                last_error = e
                 if getattr(e, "status_code", None) == 429:
+                    last_error = e
                     log.warning(f"⏳ [RATE-LIMIT] node={node} model={attempt_model} ({tag}) خطای 429: {e}")
                     continue
-                # ===== اصلاح ریشه‌ای: اگر response_format (Structured Output/JSON
+                # ===== اصلاح ریشه‌ای ۱: اگر response_format (Structured Output/JSON
                 # Schema) باعث خطا شده - برخی پرووایدرها (Groq/OpenRouter/Together)
                 # از آن پشتیبانی نمی‌کنند - همان کلاینت/مدل را یک‌بار دیگر بدون
                 # response_format امتحان کن؛ Parser مقاوم متن (_extract_json_object)
-                # همچنان خروجی آزاد را می‌فهمد. این AI Decision را کامل متوقف
-                # نمی‌کند فقط به‌خاطر عدم پشتیبانی از یک پارامتر اختیاری. =====
+                # همچنان خروجی آزاد را می‌فهمد.
                 if response_format is not None:
                     log.warning(
-                        f"⚠️ [AI-DECISION] response_format توسط {attempt_model} ({tag}) رد شد "
-                        f"({e})؛ تلاش مجدد بدون Structured Output."
+                        f"⚠️ [AI-DECISION] response_format روی {attempt_model} ({tag}) با خطای "
+                        f"{type(e).__name__} (status={getattr(e, 'status_code', None)}) رد شد ({e}); "
+                        "تلاش مجدد بدون Structured Output."
                     )
                     try:
                         return _do_call(client, attempt_model, tag, use_response_format=False)
                     except Exception as e2:
                         last_error = e2
-                        log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) retry-without-schema: {e2}")
+                        log.error(
+                            f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) "
+                            f"retry-without-schema type={type(e2).__name__}: {e2}"
+                        )
                         return None
-                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}): {e}")
+                last_error = e
+                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) type={type(e).__name__}: {e}")
                 return None
             except Exception as e:
+                # ===== اصلاح ریشه‌ای ۲: قبلاً فقط APIStatusError باعث retry بدون
+                # schema می‌شد. اما بعضی پرووایدرها/نسخه‌های SDK وقتی response_format
+                # (json_schema) را نمی‌فهمند، خطای دیگری (نه APIStatusError) می‌دهند -
+                # مثلاً خطای اعتبارسنجی سمت کلاینت. قبلاً این حالت مستقیم به
+                # return None می‌رفت و AI Decision حتی یک‌بار هم بدون Structured
+                # Output امتحان نمی‌شد؛ الان همان تلاش دوم اینجا هم انجام می‌شود. =====
+                if response_format is not None:
+                    log.warning(
+                        f"⚠️ [AI-DECISION] response_format روی {attempt_model} ({tag}) با خطای "
+                        f"{type(e).__name__} شکست خورد ({e}); تلاش مجدد بدون Structured Output."
+                    )
+                    try:
+                        return _do_call(client, attempt_model, tag, use_response_format=False)
+                    except Exception as e2:
+                        last_error = e2
+                        log.error(
+                            f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) "
+                            f"retry-without-schema type={type(e2).__name__}: {e2}"
+                        )
+                        return None
                 last_error = e
-                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}): {e}")
+                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) type={type(e).__name__}: {e}")
                 return None
 
         log.error(f"❌ [LLM-EXHAUSTED] node={node} همه‌ی مدل‌های در دسترس rate-limit شدند: {last_error}")
@@ -656,6 +696,10 @@ class AIAdvisor:
                 response_format={"type": "json_schema", "json_schema": BUY_DECISION_JSON_SCHEMA},
             )
             if response is None:
+                log.warning(
+                    "[AI-DECISION] stage=RAW status=llm_call_failed "
+                    "(دلیل دقیق در خط ❌ [LLM-ERROR]/⏳ [RATE-LIMIT] درست بالای همین خط است)"
+                )
                 log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION reason='no LLM response'")
                 return None
 
