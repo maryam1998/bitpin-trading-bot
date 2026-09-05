@@ -66,6 +66,49 @@ class Settings:
     ai_model: str = field(default_factory=lambda: os.getenv("AI_MODEL", "gpt-4o-mini"))
     ai_api_key: str = field(default_factory=lambda: os.getenv("AI_API_KEY", ""))
 
+    # ===== اصلاح مصرف توکن: مدل «ارزان/سریع» برای تصمیم‌های ساده و
+    # deterministic (مثل «چی بخرم؟» و «نظر مشاور» در گزارش موجودی) که دیگر
+    # نیازی به tool-calling چندمرحله‌ای ندارند. مدل «سنگین» (ai_model، مثلاً
+    # gpt-oss-120b) فقط برای تحلیل واقعاً پیچیده (سیگنال تکنیکال هر نماد در
+    # decide()) نگه داشته می‌شود. اگر ست نشود، پیش‌فرض همان ai_model است تا
+    # رفتار فعلی کسی که این متغیر را تنظیم نکرده تغییر نکند.
+    ai_model_fast: str = field(default_factory=lambda: os.getenv("AI_MODEL_FAST", ""))
+
+    # مدل/پرووایدر پشتیبان اختیاری: فقط وقتی استفاده می‌شود که مدل اصلی با
+    # خطای rate limit/TPD (429) مواجه شود - و فقط یک بار امتحان می‌شود
+    # (بدون retry پشت‌سرهم روی خودِ مدل اصلی که مصرف توکن/فشار rate limit
+    # را بدتر می‌کند).
+    ai_fallback_model: str = field(default_factory=lambda: os.getenv("AI_FALLBACK_MODEL", ""))
+    ai_fallback_provider: str = field(default_factory=lambda: os.getenv("AI_FALLBACK_PROVIDER", ""))
+    ai_fallback_api_key: str = field(default_factory=lambda: os.getenv("AI_FALLBACK_API_KEY", ""))
+
+    # حداکثر تعداد iteration در حلقه‌ی tool-calling (قبلاً ثابت ۵ بود؛ چون
+    # هر iteration کل تاریخچه‌ی پیام‌ها + tool specs را دوباره به مدل
+    # می‌فرستد، کم‌کردن این عدد مستقیماً مصرف توکن را در بدترین حالت کاهش
+    # می‌دهد - مخصوصاً چون decide() برای هر نماد در watchlist صدا زده می‌شود).
+    ai_max_tool_iterations: int = field(default_factory=lambda: _int("AI_MAX_TOOL_ITERATIONS", 3))
+
+    # مدت زمانی (ثانیه) که یک تصمیم AI deterministic (decide_best_action /
+    # decide_buy_recommendation) در صورت یکسان‌ماندنِ داده‌ی واقعی ورودی
+    # (candidates/opportunities/cash_ratio) از cache برگردانده می‌شود، به‌جای
+    # صدا زدن دوباره‌ی LLM. این cache صرفاً بر اساس زمان نیست: کلید آن از
+    # hash داده‌ی واقعی ورودی ساخته می‌شود، پس اگر بازار عوض شود حتی قبل از
+    # اتمام این مدت، cache باطل و یک تصمیم تازه گرفته می‌شود.
+    ai_decision_cache_seconds: int = field(default_factory=lambda: _int("AI_DECISION_CACHE_SECONDS", 180))
+
+    # ===== اصلاح مصرف توکن (بخش پس‌زمینه/run_cycle) =====
+    # قبلاً advisor.decide() برای هر نماد در watchlist در هر poll_interval_seconds
+    # (پیش‌فرض ۶۰ ثانیه) صدا زده می‌شد - یعنی مدل «سنگین» gpt-oss-120b با
+    # tool-calling کامل، حتی وقتی قیمت هیچ تغییری نکرده بود. این بخشِ اصلی
+    # مصرف توکن روزانه بود، نه چت. حالا AI فقط وقتی واقعاً صدا زده می‌شود که:
+    # (۱) حداقل ai_decision_min_interval_seconds از آخرین تصمیم AI برای همان
+    #     نماد گذشته باشد، یا
+    # (۲) قیمت به‌اندازه‌ی ai_price_change_percent از آخرین بررسی تغییر کرده باشد.
+    # در غیر این صورت آن نماد در همان چرخه WAIT در نظر گرفته می‌شود (همان
+    # رفتار امنِ فعلی وقتی AI در دسترس نیست) - هیچ معامله‌ای جعل نمی‌شود.
+    ai_decision_min_interval_seconds: int = field(default_factory=lambda: _int("AI_DECISION_MIN_INTERVAL_SECONDS", 300))
+    ai_price_change_percent: float = field(default_factory=lambda: _float("AI_PRICE_CHANGE_PERCENT", 1.0))
+
     # ===== قابلیت‌های جدید Agent خودمختار =====
     active_learning_enabled: bool = field(default_factory=lambda: _bool("ACTIVE_LEARNING_ENABLED", True))
     dynamic_planning_enabled: bool = field(default_factory=lambda: _bool("DYNAMIC_PLANNING_ENABLED", True))

@@ -1,16 +1,79 @@
+import hashlib
 import logging
 import json
+import time
 from typing import Dict, Any, List, Optional
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIStatusError
 from app.strategies.base import Signal, Action
 
 log = logging.getLogger(__name__)
 
-MAX_TOOL_ITERATIONS = 5
 
-SYSTEM_PROMPT_DECISION = """شما یک تحلیلگر بازار هوشمند هستید... (بدون تغییر)"""
+class _StateCache:
+    """
+    ===== اصلاح مصرف توکن: cache بر اساس «state» واقعی، نه فقط زمان =====
+    برای تصمیم‌های deterministic (decide_best_action / decide_buy_recommendation)
+    که ورودی‌شان کاملاً از داده‌ی واقعی پایتون (candidates/opportunities/
+    cash_ratio) ساخته می‌شود: اگر همین داده‌ی واقعی نسبت به آخرین بار عوض
+    نشده باشد، هیچ دلیلی ندارد که دوباره همان سوال را از LLM بپرسیم و توکن
+    مصرف کنیم - نتیجه‌ی قبلی هنوز هم صحیح است. کلید cache از hash خودِ
+    context ساخته می‌شود، پس به محض تغییر واقعی بازار/پرتفولیو، cache
+    خودکار باطل می‌شود؛ این صرفاً یک cache زمان‌محور کور نیست.
+    """
 
-SYSTEM_PROMPT_CHAT = """شما یک مشاور مالی... (بدون تغییر)"""
+    def __init__(self):
+        self._store: Dict[str, Any] = {}
+
+    @staticmethod
+    def _hash(context: Any) -> str:
+        payload = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+    def get(self, key: str, context: Any, max_age_seconds: int) -> Optional[Any]:
+        entry = self._store.get(key)
+        if not entry:
+            return None
+        state_hash, ts, value = entry
+        if state_hash != self._hash(context):
+            return None
+        if time.time() - ts > max_age_seconds:
+            return None
+        return value
+
+    def set(self, key: str, context: Any, value: Any) -> None:
+        self._store[key] = (self._hash(context), time.time(), value)
+
+# ===== اصلاح ریشه‌ای: این دو پرامپت قبلاً فقط یک متن جایگزین (stub) بودند
+# ("... (بدون تغییر)") و عملاً هیچ دستورالعمل واقعی به مدل نمی‌دادند. با یک
+# پرامپت تقریباً خالی، مدل هیچ الزامی به استفاده واقعی از ابزارها یا اجتناب
+# از پیش‌فرض WAIT نداشت - این یکی از دلایل اصلی رفتار «صبر ثابت» بود.
+SYSTEM_PROMPT_DECISION = """شما یک تحلیلگر بازار هوشمند هستید که برای یک نماد مشخص تصمیم معاملاتی می‌گیرید.
+
+قوانین اجباری:
+1. تصمیم WAIT نباید پیش‌فرض باشد. پیش از تصمیم‌گیری، با ابزارهای در دسترس (get_technical_indicators،
+   get_historical_data، get_market_overview، get_news_headlines) وضعیت واقعی این نماد را بررسی کن.
+2. اگر اندیکاتورهای فنی (RSI، EMA، MACD) یا روند قیمت واقعی یک فرصت معتبر BUY یا SELL نشان دادند،
+   مجاز و موظفی همان اکشن را برگردانی؛ WAIT فقط زمانی مجاز است که بررسی واقعی هیچ فرصت روشنی نشان ندهد.
+3. هرگز عدد، قیمت یا درصدی که از ابزارها یا ورودی کاربر به‌دست نیامده نساز یا حدس نزن.
+4. اگر به WAIT رسیدی، در «reason» دلیل مشخص و واقعی از داده‌ی بررسی‌شده بنویس، نه یک جمله‌ی کلی.
+5. فقط یک JSON با ساختار زیر برگردان و هیچ متن دیگری قبل یا بعد آن ننویس:
+{"action": "BUY" | "SELL" | "WAIT", "reason": "<دلیل به فارسی>", "entry_price": <عدد یا null>,
+ "stop_loss": <عدد یا null>, "take_profit": <عدد یا null>}
+"""
+
+SYSTEM_PROMPT_CHAT = """شما یک مشاور مالی و معاملاتی هستید که به زبان فارسی به سوالات کاربر درباره‌ی
+بازار، پرتفولیوی او، و فرصت‌های معاملاتی پاسخ می‌دهید.
+
+قوانین اجباری:
+1. هرگز بر اساس دانش قدیمی یا حدس پاسخ نده. پیش از هر پاسخی درباره‌ی قیمت، فرصت خرید/فروش، یا وضعیت
+   بازار، حتماً از ابزارهای در دسترس (get_market_prices، get_portfolio_snapshot، get_market_overview،
+   get_opportunities، get_technical_indicators، get_historical_data، get_news_headlines) استفاده کن.
+2. اگر کاربر می‌پرسد «چی بخرم» یا مشابه آن، باید چند دارایی واقعی را (نه فقط یکی) با get_opportunities
+   یا get_market_prices/get_technical_indicators مقایسه کنی و بهترین گزینه را با دلیل مشخص کنی؛ اگر
+   واقعاً هیچ فرصت خرید معتبری نبود، صریح بگو WAIT بهتر است و دلیل واقعی از داده‌ی بررسی‌شده بیاور.
+3. هرگز عدد، قیمت، یا درصدی که از خروجی ابزارها یا پیام کاربر به‌دست نیامده نساز.
+4. اگر یک ابزار خطا داد یا داده‌ای برنگرداند، این را صریح به کاربر بگو؛ وانمود نکن تحلیل انجام شده.
+"""
 
 # ===== اصلاح: تصمیم «بهترین کار الان» دیگر یک Rule ثابت در ChatHandler نیست =====
 # قبلاً اگر بیش از نیمی از سرمایه نقد (USDT/IRT) بود، همیشه و بدون قید و شرط
@@ -42,6 +105,23 @@ SYSTEM_PROMPT_BEST_ACTION = """شما یک مشاور معاملاتی هستی�
 # می‌کند و این باعث import چرخه‌ای می‌شود).
 OPPORTUNITY_SYMBOLS = ["BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", "LINK", "SHIB"]
 MIN_OPPORTUNITY_CHANGE_PERCENT = 5.0
+
+# ===== پرامپت AI Decision برای فلوی «الان چی بخرم؟» (deterministic، بدون tool-calling) =====
+SYSTEM_PROMPT_BUY_DECISION = """شما یک تحلیلگر معاملاتی هستید. به شما یک لیست از چند دارایی واقعی
+(candidates) به همراه قیمت لحظه‌ای، درصد تغییر ۲۴ ساعته، وضعیت پرتفولیوی کاربر و عناوین اخبار داده
+می‌شود. باید بگویید که آیا الان یک فرصت خرید معتبر بین همین دارایی‌ها وجود دارد یا نه.
+
+قوانین اجباری:
+1. WAIT پیش‌فرض نیست. اگر یکی از candidates واقعاً افت قیمت قابل‌توجه (is_opportunity=true, action=BUY)
+   داشت، باید همان را با اکشن BUY انتخاب کنی، مگر اینکه دلیل روشنی (مثلاً خبر بد مرتبط) علیه آن باشد.
+2. باید حداقل چند candidate را با هم مقایسه کنی، نه اینکه فقط اولی را بدون بررسی انتخاب/رد کنی.
+3. symbol فقط می‌تواند یکی از نمادهای موجود در candidates باشد؛ هرگز نماد یا عددی که در ورودی نیامده
+   نساز یا حدس نزن.
+4. اگر به WAIT رسیدی، در reason دقیقاً بگو چرا هیچ‌کدام از candidates فرصت معتبری نبودند (با اشاره به
+   درصد تغییر واقعی‌شان)، نه یک جمله‌ی کلی و تکراری.
+5. فقط و فقط یک JSON با این ساختار برگردان، بدون هیچ متن اضافه قبل یا بعد آن:
+{"action": "BUY" | "WAIT", "symbol": "<یکی از candidates یا null>", "reason": "<دلیل به فارسی>"}
+"""
 
 PROVIDER_BASE_URLS = {
     "openai": None,  # پیش‌فرض OpenAI (base_url رسمی خودش)
@@ -100,16 +180,46 @@ class AIAdvisor:
                 settings.ai_model = "openai/gpt-oss-120b"
 
             try:
+                # ===== اصلاح: max_retries=0 =====
+                # کلاینت رسمی OpenAI به‌صورت پیش‌فرض روی خطاهای موقت (از جمله
+                # 429) خودش ۲ بار دیگر همان درخواست را (با همان تعداد توکن
+                # ورودی) عیناً تکرار می‌کند. وقتی مشکل TPD/rate-limit است، این
+                # retry خودکار فقط فشار را روی همان مدل بیشتر می‌کند و مصرف
+                # توکن را در بدترین حالت ۳ برابر می‌کند. آن را غیرفعال
+                # می‌کنیم و خودمان (در _call_llm) فقط یک‌بار به مدل/پرووایدر
+                # پشتیبان (در صورت تنظیم) سوییچ می‌کنیم - نه retry پشت‌سرهم.
                 if base_url:
-                    self.client = OpenAI(api_key=settings.ai_api_key, base_url=base_url)
+                    self.client = OpenAI(api_key=settings.ai_api_key, base_url=base_url, max_retries=0)
                 else:
-                    self.client = OpenAI(api_key=settings.ai_api_key)
+                    self.client = OpenAI(api_key=settings.ai_api_key, max_retries=0)
                 log.info(f"AI enabled: {provider}/{settings.ai_model}")
             except Exception as e:
                 log.error(f"Failed to initialize AI client: {e}")
                 self.client = None
         else:
             log.warning("AI is disabled or API key is missing. Check AI_API_KEY.")
+
+        # ===== کلاینت پشتیبان (اختیاری) - فقط اگر AI_FALLBACK_* تنظیم شده
+        # باشد ساخته می‌شود. فقط زمانی استفاده می‌شود که مدل اصلی 429/TPD
+        # بدهد؛ در غیر این صورت هیچ‌وقت صدا زده نمی‌شود. =====
+        self.fallback_client = None
+        if self.client is not None and settings.ai_fallback_model and settings.ai_fallback_api_key:
+            try:
+                fb_provider = (settings.ai_fallback_provider or "openai").lower()
+                fb_base_url = PROVIDER_BASE_URLS.get(fb_provider)
+                self.fallback_client = OpenAI(
+                    api_key=settings.ai_fallback_api_key, base_url=fb_base_url, max_retries=0
+                )
+            except Exception as e:
+                log.error(f"Failed to initialize fallback AI client: {e}")
+                self.fallback_client = None
+
+        # مدل «سریع/ارزان» برای تصمیم‌های ساده‌ی deterministic. اگر تنظیم
+        # نشده باشد، همان ai_model اصلی استفاده می‌شود (رفتار فعلی حفظ می‌شود).
+        self.fast_model = settings.ai_model_fast or settings.ai_model
+        self.max_tool_iterations = max(1, int(getattr(settings, "ai_max_tool_iterations", 3) or 3))
+        self.decision_cache_seconds = int(getattr(settings, "ai_decision_cache_seconds", 180) or 180)
+        self._decision_cache = _StateCache()
 
         self._tool_specs = self._build_tool_specs()
         self._tool_impls = {
@@ -122,6 +232,65 @@ class AIAdvisor:
             "get_opportunities": self._tool_get_opportunities,
             "get_news_headlines": self._tool_get_news_headlines,
         }
+
+    def _call_llm(self, *, node: str, model: str, messages: List[Dict[str, Any]],
+                  max_tokens: int, temperature: float,
+                  tools: Optional[List[Dict[str, Any]]] = None) -> Optional[Any]:
+        """
+        ===== نقطه‌ی مرکزی همه‌ی فراخوانی‌های LLM =====
+        - Token usage هر درخواست را در لاگ (Debug/Info) ثبت می‌کند.
+        - روی 429/TPD کرش نمی‌کند: پیام واضح لاگ می‌کند و فقط یک‌بار (نه
+          پشت‌سرهم) به مدل/پرووایدر پشتیبان (در صورت تنظیم) سوییچ می‌کند.
+        - اگر هیچ گزینه‌ای جواب ندهد، None برمی‌گرداند تا caller از همان
+          fallback قانون‌محور موجودش استفاده کند (رفتار فعلی این بخش‌ها).
+        """
+        if not self.client:
+            return None
+
+        attempts = [(self.client, model, "primary")]
+        if self.fallback_client and self.settings.ai_fallback_model:
+            attempts.append((self.fallback_client, self.settings.ai_fallback_model, "fallback"))
+
+        kwargs_base = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        if tools:
+            kwargs_base["tools"] = tools
+            kwargs_base["tool_choice"] = "auto"
+
+        last_error = None
+        for client, attempt_model, tag in attempts:
+            try:
+                response = client.chat.completions.create(model=attempt_model, **kwargs_base)
+                usage = getattr(response, "usage", None)
+                if usage:
+                    log.info(
+                        f"📊 [TOKEN-USAGE] node={node} model={attempt_model} ({tag}) "
+                        f"prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
+                        f"total={usage.total_tokens}"
+                    )
+                return response
+            except RateLimitError as e:
+                last_error = e
+                log.warning(
+                    f"⏳ [RATE-LIMIT] node={node} model={attempt_model} ({tag}) به سقف "
+                    f"rate limit/TPD رسید: {e}. "
+                    + ("در حال امتحان مدل پشتیبان..." if tag == "primary" and self.fallback_client
+                       else "مدل/پرووایدر پشتیبانی برای این درخواست تنظیم نشده؛ متوقف می‌شود (بدون retry).")
+                )
+                continue
+            except APIStatusError as e:
+                last_error = e
+                if getattr(e, "status_code", None) == 429:
+                    log.warning(f"⏳ [RATE-LIMIT] node={node} model={attempt_model} ({tag}) خطای 429: {e}")
+                    continue
+                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}): {e}")
+                return None
+            except Exception as e:
+                last_error = e
+                log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}): {e}")
+                return None
+
+        log.error(f"❌ [LLM-EXHAUSTED] node={node} همه‌ی مدل‌های در دسترس rate-limit شدند: {last_error}")
+        return None
 
     def decide(self, asset: str, symbol: str) -> Signal:
         """تصمیم‌گیری با AI یا WAIT در صورت عدم دسترسی"""
@@ -159,17 +328,16 @@ class AIAdvisor:
             log.error(f"AI decision error for {asset}: {e}")
             return Signal(market=symbol, action=Action.WAIT, reason=f"AI error: {str(e)[:50]}", current_price=0.0)
 
-    def _run_decision_tools(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-        for iteration in range(MAX_TOOL_ITERATIONS):
-            kwargs = {
-                "model": self.settings.ai_model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": 800,
-                "tools": self._tool_specs,
-                "tool_choice": "auto",
-            }
-            response = self.client.chat.completions.create(**kwargs)
+    def _run_decision_tools(self, messages: List[Dict[str, Any]], node: str = "decide",
+                             model: Optional[str] = None) -> Dict[str, Any]:
+        model = model or self.settings.ai_model
+        for iteration in range(self.max_tool_iterations):
+            response = self._call_llm(
+                node=f"{node}#{iteration}", model=model,
+                messages=messages, temperature=0.3, max_tokens=800, tools=self._tool_specs,
+            )
+            if response is None:
+                return {"action": "WAIT", "reason": "AI rate-limited or unavailable"}
             msg = response.choices[0].message
             tool_calls = getattr(msg, "tool_calls", None)
 
@@ -245,6 +413,15 @@ class AIAdvisor:
         if not self.client:
             return None
 
+        # ===== اصلاح مصرف توکن: cache بر اساس state واقعی =====
+        # اگر cash_ratio/opportunities/held_assets نسبت به آخرین بار عوض
+        # نشده باشد (مثلاً کاربر چند بار پشت‌سرهم «موجودی» را می‌پرسد)، به‌جای
+        # صدا زدن دوباره‌ی LLM همان تصمیم قبلی (که هنوز هم صحیح است) برگردانده
+        # می‌شود. به محض تغییر واقعی این عددها، cache خودکار باطل می‌شود.
+        cached = self._decision_cache.get("best_action", portfolio_context, self.decision_cache_seconds)
+        if cached is not None:
+            return cached
+
         try:
             user_content = (
                 "این‌ها اعداد واقعی و محاسبه‌شده از API هستند (خودت عدد جدید نساز):\n"
@@ -257,12 +434,15 @@ class AIAdvisor:
                 {"role": "system", "content": SYSTEM_PROMPT_BEST_ACTION},
                 {"role": "user", "content": user_content},
             ]
-            result = self._run_decision_tools(messages)
+            # ===== اصلاح مصرف توکن: این تصمیم دیگر «تحلیل پیچیده» نیست
+            # (چون cash_ratio/opportunities از قبل در پایتون آماده شده‌اند)،
+            # پس از مدل سریع/ارزان استفاده می‌شود، نه gpt-oss-120b. =====
+            result = self._run_decision_tools(messages, node="best_action", model=self.fast_model)
 
             # این دو مقدار فقط زمانی برگردانده می‌شوند که AI اصلاً نتوانسته
             # پاسخ معتبر بدهد (خطا/تمام‌شدن iteration‌ها) - این‌ها تصمیم واقعی
             # نیستند و نباید به کاربر نشان داده شوند؛ باید fallback فعال شود.
-            if result.get("reason") in {"No valid JSON", "Max iterations exceeded"}:
+            if result.get("reason") in {"No valid JSON", "Max iterations exceeded", "AI rate-limited or unavailable"}:
                 return None
 
             action = result.get("action")
@@ -270,9 +450,119 @@ class AIAdvisor:
             if action not in {"BUY", "SELL", "REDUCE_CONCENTRATION", "WAIT"} or not reason:
                 return None
 
-            return {"action": action, "symbol": result.get("symbol"), "reason": reason}
+            final = {"action": action, "symbol": result.get("symbol"), "reason": reason}
+            self._decision_cache.set("best_action", portfolio_context, final)
+            return final
         except Exception as e:
             log.error(f"AI best-action decision error: {e}")
+            return None
+
+    def decide_buy_recommendation(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        ===== AI Decision node برای فلوی «الان چی بخرم؟» =====
+        برخلاف decide_best_action (که به مدل اجازه می‌دهد خودش تصمیم بگیرد کدام
+        ابزار را صدا بزند - و اگر مدل هیچ ابزاری صدا نزند، تحلیل واقعی انجام
+        نمی‌شود)، این متد کاملاً deterministic است: Portfolio/Market/News/
+        Opportunity Analysis از قبل در پایتون واقعی اجرا و در «context» جمع
+        شده‌اند. از مدل فقط یک تحلیل و تصمیم روی همین داده‌ی واقعی خواسته
+        می‌شود - نه فراخوانی ابزار، نه ساختن عدد جدید. این یعنی حتی اگر مدل
+        هیچ tool call‌ای نزند (که اینجا اصلاً امکانش نیست چون tools پاس داده
+        نمی‌شود)، باز هم همه‌ی داده‌های واقعی جلوی او هست.
+
+        context باید شامل باشد:
+          - portfolio: خلاصه‌ی پرتفولیو (cash_ratio_percent، held_assets، ...)
+          - candidates: خروجی AIAdvisor.get_market_comparison() (چند دارایی واقعی)
+          - news: خروجی AIAdvisor.get_news()
+
+        خروجی در صورت موفقیت: {"action": "BUY"|"WAIT", "symbol": <از میان
+        candidates یا None>, "reason": <فارسی>, "considered_symbols": [...]}.
+        اگر مدل در دسترس نبود یا JSON نامعتبر/نماد جعلی برگرداند، None
+        برمی‌گردد تا caller (ChatHandler) این را صریحاً به کاربر اعلام کند - نه
+        اینکه به‌طور خاموش یک WAIT ساختگی نشان بدهد.
+        """
+        if not self.client:
+            return None
+
+        candidate_symbols = {c["symbol"] for c in context.get("candidates", {}).get("candidates", [])}
+
+        # ===== اصلاح مصرف توکن: cache بر اساس state واقعی =====
+        # همان منطق decide_best_action: اگر candidates/portfolio/news نسبت
+        # به آخرین بار عوض نشده باشند (مثلاً کاربر چند بار «چی بخرم؟» را
+        # پشت‌سرهم می‌پرسد)، تصمیم قبلی (که هنوز هم صحیح است) بدون صدا زدن
+        # دوباره‌ی LLM برگردانده می‌شود.
+        cached = self._decision_cache.get("buy_recommendation", context, self.decision_cache_seconds)
+        if cached is not None:
+            return cached
+
+        # ===== اصلاح مصرف توکن: context فشرده =====
+        # قبلاً کل context (شامل همه‌ی فیلدهای هر candidate و تا ۶ خبر) عیناً
+        # به‌عنوان JSON به مدل داده می‌شد. اینجا فقط فیلدهای لازم برای تصمیم
+        # نگه داشته می‌شوند و اخبار به ۳ عنوان کوتاه می‌شوند - داده‌ی واقعی
+        # حذف نمی‌شود، فقط تکرار/فیلدهای غیرضروری از پرامپت خارج می‌شوند.
+        compact_candidates = [
+            {k: c[k] for k in ("symbol", "price", "change_percent_24h", "is_opportunity", "action", "reason")
+             if k in c}
+            for c in context.get("candidates", {}).get("candidates", [])
+        ]
+        compact_news = [h.get("title", "") for h in context.get("news", {}).get("headlines", [])[:3]]
+        compact_context = {
+            "portfolio": context.get("portfolio", {}),
+            "candidates": compact_candidates,
+            "news_headlines": compact_news,
+        }
+
+        try:
+            user_content = (
+                "این‌ها داده‌ی واقعی هستند که همین الان از API/پایتون جمع شده‌اند (خودت عدد جدید نساز):\n"
+                + json.dumps(compact_context, ensure_ascii=False, default=str)
+                + "\n\nبا مقایسه‌ی چند دارایی موجود در candidates (نه فقط یکی)، تصمیم بگیر که آیا الان "
+                  "فرصت خرید معتبری وجود دارد یا نه. طبق قوانین سیستم فقط یک JSON برگردان."
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_BUY_DECISION},
+                {"role": "user", "content": user_content},
+            ]
+            # ===== اصلاح مصرف توکن: تصمیم روی داده‌ی از‌پیش‌آماده‌شده، بدون
+            # tool-calling، «تحلیل پیچیده» نیست - مدل سریع/ارزان کافی است. =====
+            response = self._call_llm(
+                node="buy_recommendation", model=self.fast_model,
+                messages=messages, temperature=0.2, max_tokens=500,
+            )
+            if response is None:
+                return None
+            content = response.choices[0].message.content or ""
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start == -1 or end <= start:
+                log.warning(f"decide_buy_recommendation: no JSON in model output: {content[:200]!r}")
+                return None
+            result = json.loads(content[start:end])
+
+            action = result.get("action")
+            reason = result.get("reason")
+            if action not in {"BUY", "WAIT"} or not reason:
+                log.warning(f"decide_buy_recommendation: invalid structure: {result!r}")
+                return None
+
+            symbol = result.get("symbol")
+            if action == "BUY":
+                if not symbol or symbol not in candidate_symbols:
+                    log.warning(
+                        f"decide_buy_recommendation: model returned BUY for {symbol!r} which is not "
+                        f"among fetched candidates {candidate_symbols}; rejecting hallucinated pick."
+                    )
+                    return None
+
+            final = {
+                "action": action,
+                "symbol": symbol if action == "BUY" else None,
+                "reason": reason,
+                "considered_symbols": sorted(candidate_symbols),
+            }
+            self._decision_cache.set("buy_recommendation", context, final)
+            return final
+        except Exception as e:
+            log.error(f"decide_buy_recommendation error: {e}")
             return None
 
     # ===== ابزارها =====
@@ -508,20 +798,29 @@ class AIAdvisor:
             ),
         }
 
-    def _tool_get_opportunities(self) -> Dict[str, Any]:
+    def get_market_comparison(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        فرصت‌های واقعی بازار بر اساس درصد تغییر قیمت واقعی ۲۴ ساعته (همان
-        معیار MarketIntelligence._find_opportunities) - برای اینکه تصمیم
-        «بهترین کار الان» بتواند واقعاً به یک فرصت خرید/فروش واقعی برسد، نه
-        فقط ترکیب درصدی پرتفولیو. اعداد همگی از get_all_prices/get_historical
-        واقعی می‌آیند؛ چیزی اینجا ساخته نمی‌شود.
+        ===== Market Data Tool + Opportunity Analysis (واقعی، بدون AI) =====
+        این متد عمومی، مقایسه‌ی واقعی چند دارایی را برمی‌گرداند - نه فقط یک
+        دارایی. برای هر نماد کاندید (پیش‌فرض OPPORTUNITY_SYMBOLS)، قیمت لحظه‌ای
+        (get_all_prices) و تغییر قیمت ۲۴ ساعته (get_historical) واقعی محاسبه
+        می‌شود. این داده مستقیماً به AI Decision داده می‌شود تا AI مجبور شود
+        چند دارایی را واقعاً مقایسه کند، نه اینکه فقط یک نماد را حدس بزند.
+
+        خروجی شامل «candidates» (همه‌ی نمادهایی که قیمت واقعی برایشان پیدا شد،
+        صرف‌نظر از اینکه فرصت باشند یا نه) و «opportunities» (زیرمجموعه‌ای که
+        از آستانه‌ی MIN_OPPORTUNITY_CHANGE_PERCENT عبور کرده‌اند) است.
+        اگر market_data_manager در دسترس نباشد یا هیچ قیمت واقعی‌ای برنگردد،
+        این صریحاً با "error"/"unpriced_symbols" گزارش می‌شود - چیزی جعل نمی‌شود.
         """
+        symbols = symbols or OPPORTUNITY_SYMBOLS
         if not self.market_data_manager:
-            return {"error": "market_data_manager not available"}
+            return {"error": "market_data_manager not available", "candidates": []}
+
         try:
-            prices = self.market_data_manager.get_all_prices(symbols=OPPORTUNITY_SYMBOLS)
+            prices = self.market_data_manager.get_all_prices(symbols=symbols)
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e), "candidates": []}
 
         portfolio_amounts: Dict[str, float] = {}
         if self.portfolio_manager:
@@ -531,42 +830,67 @@ class AIAdvisor:
             except Exception:
                 portfolio_amounts = {}
 
-        opportunities = []
-        for symbol in OPPORTUNITY_SYMBOLS:
+        candidates = []
+        unpriced_symbols = []
+        for symbol in symbols:
             price = prices.get(symbol)
             if not price or price <= 0:
+                unpriced_symbols.append(symbol)
                 continue
             try:
                 history = self.market_data_manager.get_historical(symbol, days=1)
             except Exception:
                 history = None
-            if not history or len(history) < 2:
-                continue
-            first_price = history[0].get("price", 0)
-            last_price = history[-1].get("price", 0)
-            if first_price <= 0:
-                continue
-            change = ((last_price - first_price) / first_price) * 100
+
+            change = None
+            if history and len(history) >= 2:
+                first_price = history[0].get("price", 0)
+                last_price = history[-1].get("price", 0)
+                if first_price > 0:
+                    change = round(((last_price - first_price) / first_price) * 100, 2)
+
             holding = portfolio_amounts.get(symbol, 0) or 0
-
-            if change <= -MIN_OPPORTUNITY_CHANGE_PERCENT:
-                opportunities.append({
-                    "symbol": symbol,
-                    "action": "BUY",
-                    "price": price,
-                    "change_percent_24h": round(change, 2),
-                    "reason": f"در ۲۴ ساعت اخیر {change:.1f}% افت کرده",
-                })
+            entry = {
+                "symbol": symbol,
+                "price": price,
+                "change_percent_24h": change,
+                "held_amount": holding,
+            }
+            if change is None:
+                entry["note"] = "داده‌ی تاریخی ۲۴ ساعته در دسترس نیست"
+            elif change <= -MIN_OPPORTUNITY_CHANGE_PERCENT:
+                entry["is_opportunity"] = True
+                entry["action"] = "BUY"
+                entry["reason"] = f"در ۲۴ ساعت اخیر {change:.1f}% افت کرده"
             elif change >= MIN_OPPORTUNITY_CHANGE_PERCENT and holding > 0:
-                opportunities.append({
-                    "symbol": symbol,
-                    "action": "SELL",
-                    "price": price,
-                    "change_percent_24h": round(change, 2),
-                    "reason": f"در ۲۴ ساعت اخیر {change:.1f}% رشد کرده و شما این دارایی را دارید",
-                })
+                entry["is_opportunity"] = True
+                entry["action"] = "SELL"
+                entry["reason"] = f"در ۲۴ ساعت اخیر {change:.1f}% رشد کرده و شما این دارایی را دارید"
+            else:
+                entry["is_opportunity"] = False
+            candidates.append(entry)
 
-        return {"opportunities": opportunities}
+        result = {"candidates": candidates}
+        if unpriced_symbols:
+            result["unpriced_symbols"] = unpriced_symbols
+        result["opportunities"] = [c for c in candidates if c.get("is_opportunity")]
+        return result
+
+    def get_news(self, limit: int = 6) -> Dict[str, Any]:
+        """News Tool عمومی - همان منطق _tool_get_news_headlines اما با نام قابل فراخوانی مستقیم."""
+        return self._tool_get_news_headlines(limit=limit)
+
+    def _tool_get_opportunities(self) -> Dict[str, Any]:
+        """
+        نسخه‌ی سازگار با tool-calling قدیمی: فقط زیرمجموعه‌ی «opportunities»
+        را برمی‌گرداند (برای decide()/decide_best_action() که از حلقه‌ی
+        function-calling استفاده می‌کنند). منطق واقعی در get_market_comparison
+        متمرکز شده تا در دو مسیر جدا تکرار/واگرا نشود.
+        """
+        comparison = self.get_market_comparison()
+        if "error" in comparison:
+            return comparison
+        return {"opportunities": comparison.get("opportunities", [])}
 
     def _tool_get_news_headlines(self, limit: int = 6) -> Dict[str, Any]:
         """
@@ -605,16 +929,16 @@ class AIAdvisor:
             return f"❌ خطا: {e}"
 
     def _run_chat_tools(self, messages: List[Dict[str, Any]]) -> str:
-        for iteration in range(MAX_TOOL_ITERATIONS):
-            kwargs = {
-                "model": self.settings.ai_model,
-                "messages": messages,
-                "temperature": 0.4,
-                "max_tokens": 1000,
-                "tools": self._tool_specs,
-                "tool_choice": "auto",
-            }
-            response = self.client.chat.completions.create(**kwargs)
+        # ===== اصلاح: این مسیر («BTC چطوره؟» و سوالات آزاد مشابه) دیگر یک
+        # تحلیل «پیچیده» نیست - از مدل سریع/ارزان (fast_model) استفاده
+        # می‌شود، نه gpt-oss-120b. =====
+        for iteration in range(self.max_tool_iterations):
+            response = self._call_llm(
+                node=f"chat#{iteration}", model=self.fast_model,
+                messages=messages, temperature=0.4, max_tokens=700, tools=self._tool_specs,
+            )
+            if response is None:
+                return "🤖 مدل هوش مصنوعی موقتاً به سقف مصرف توکن رسیده (rate limit/TPD)؛ لطفاً کمی بعد دوباره امتحان کن."
             msg = response.choices[0].message
             tool_calls = getattr(msg, "tool_calls", None)
 

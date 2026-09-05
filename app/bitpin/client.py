@@ -1,7 +1,7 @@
 import logging
 import time
 import requests
-from app.bitpin.auth import BitpinAuth
+from app.bitpin.auth import BitpinAuth, BitpinAuthError
 
 log = logging.getLogger(__name__)
 
@@ -14,22 +14,48 @@ class BitpinClient:
 
     def _request(self, method: str, path: str, auth_required: bool = False, params: dict = None, json_body: dict = None, max_retries: int = 3):
         url = self.base_url + path
-        headers = {}
-        if auth_required:
-            headers.update(self.auth.auth_header(self.session))
 
         last_exc = None
         for attempt in range(max_retries):
             try:
+                # ===== اصلاح: گرفتن هدر Authorization داخل حلقه‌ی retry =====
+                # قبلاً auth.auth_header() فقط یک بار و بیرون از حلقه صدا زده
+                # می‌شد؛ یعنی اگه توکن معتبر نبود و Login با 429 مواجه می‌شد،
+                # کل _request بلافاصله و بدون هیچ retry/backoffی fail می‌شد.
+                # حالا این خطا هم مثل بقیه‌ی خطاهای شبکه از همین حلقه رد
+                # می‌شود، با این تفاوت که BitpinAuthError جداگانه مدیریت
+                # می‌شود (پایین‌تر) تا در بازه‌ی backoff دوباره درخواست
+                # شبکه‌ی جدیدی برای Login زده نشود.
+                headers = {}
+                if auth_required:
+                    headers.update(self.auth.auth_header(self.session))
+
                 resp = self.session.request(method, url, params=params, json=json_body, headers=headers, timeout=self.timeout)
                 if resp.status_code >= 400:
                     raise Exception(f"{method} {path} -> {resp.status_code}: {resp.text[:300]}")
                 return resp.json()
+            except BitpinAuthError as e:
+                # ===== اصلاح: خطای 429/rate-limit روی Login نباید بلافاصله
+                # با یک درخواست شبکه‌ی جدید دوباره امتحان شود. خودِ
+                # BitpinAuth.get_token در این حالت اصلاً درخواست شبکه‌ای نزده
+                # (fail-fast)، پس اینجا هم فقط منتظر می‌مانیم و در صورت
+                # اتمام تلاش‌ها، همین خطای مشخص را بالا می‌بریم تا caller
+                # (مثلاً PortfolioManager) بتواند به‌شکل graceful هندلش کند
+                # و کل Portfolio با یک exception خام از کار نیفتد.
+                last_exc = e
+                if attempt == max_retries - 1:
+                    break
+                wait = 2 ** attempt
+                log.warning(f"Bitpin auth rate-limited, waiting {wait}s before retry ({attempt + 1}/{max_retries}): {e}")
+                time.sleep(wait)
             except Exception as e:
                 last_exc = e
                 wait = 2 ** attempt
                 log.warning(f"Request failed, retrying in {wait}s: {e}")
                 time.sleep(wait)
+
+        if isinstance(last_exc, BitpinAuthError):
+            raise last_exc
         raise Exception(f"Failed {method} {path} after {max_retries} retries: {last_exc}")
 
     def get_ticker(self, symbol: str = None):

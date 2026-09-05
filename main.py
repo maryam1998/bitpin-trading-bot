@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
+from typing import Dict
 
 from app.config.settings import settings
 from app.monitoring.health import start_health_server_in_background
@@ -22,7 +23,7 @@ from app.risk.manager import RiskManager
 from app.execution.paper import PaperTradingEngine
 from app.execution.live import LiveExecutionEngine
 from app.database.repository import Repository
-from app.strategies.base import Action
+from app.strategies.base import Action, Signal
 from app.chat.handler import ChatHandler
 from app.forecast.report import ForecastReport
 
@@ -38,6 +39,43 @@ log = logging.getLogger("main")
 _last_signal = {}
 _last_signal_time = {}
 SIGNAL_COOLDOWN = getattr(settings, 'signal_cooldown_seconds', 1800)  # ۳۰ دقیقه
+
+# ===== اصلاح مصرف توکن: کنترل تعداد فراخوانی واقعی AI در حلقه‌ی پس‌زمینه =====
+# فقط زمان/قیمتِ «آخرین تصمیم واقعی AI» به ازای هر نماد نگه داشته می‌شود؛
+# منطق معامله/ریسک/کیف‌پول کاملاً دست‌نخورده می‌ماند - این فقط تعیین می‌کند
+# که آیا advisor.decide() این چرخه صدا زده شود یا نه.
+_last_ai_decision: Dict[str, Dict[str, float]] = {}
+
+
+def _should_call_ai_decision(symbol: str, current_price: float) -> bool:
+    """
+    True یعنی واقعاً وقت صدا زدن AI (مدل سنگین) برای این نماد است:
+    یا حداقل ai_decision_min_interval_seconds گذشته، یا قیمت به‌اندازه‌ی کافی
+    (ai_price_change_percent) از آخرین بررسی تغییر کرده. در غیر این صورت
+    False برمی‌گردد و نماد در این چرخه WAIT در نظر گرفته می‌شود - بدون هیچ
+    فراخوانی LLM (دقیقاً همان رفتار امن فعلی برای «AI در دسترس نیست»).
+    """
+    now = time.time()
+    state = _last_ai_decision.get(symbol)
+    min_interval = getattr(settings, "ai_decision_min_interval_seconds", 300)
+    change_threshold = getattr(settings, "ai_price_change_percent", 1.0)
+
+    if state is None:
+        _last_ai_decision[symbol] = {"time": now, "price": current_price or 0.0}
+        return True
+
+    if (now - state["time"]) >= min_interval:
+        _last_ai_decision[symbol] = {"time": now, "price": current_price or 0.0}
+        return True
+
+    if current_price and state.get("price"):
+        change_pct = abs(current_price - state["price"]) / state["price"] * 100
+        if change_pct >= change_threshold:
+            _last_ai_decision[symbol] = {"time": now, "price": current_price}
+            return True
+
+    return False
+
 
 def should_send_signal(symbol: str, new_action: str) -> bool:
     """بررسی آیا سیگنال جدید باید ارسال شود"""
@@ -203,8 +241,26 @@ def run_cycle(
 
             # ===== ۲. تصمیم‌گیری =====
             if advisor is not None and settings.ai_enabled:
-                signal = advisor.decide(asset, symbol)
-                log.info(f"🤖 AI decision for {symbol}: {signal.action.value} - {signal.reason}")
+                current_price_for_gate = current_prices.get(symbol)
+                if _should_call_ai_decision(symbol, current_price_for_gate):
+                    signal = advisor.decide(asset, symbol)
+                    log.info(f"🤖 AI decision for {symbol}: {signal.action.value} - {signal.reason}")
+                else:
+                    # ===== اصلاح مصرف توکن =====
+                    # قیمت به‌اندازه‌ی کافی تغییر نکرده و زمان کافی هم از
+                    # آخرین تصمیم واقعی AI نگذشته - صدا زدن دوباره‌ی مدل
+                    # سنگین (gpt-oss-120b) با کل tool-calling برای این نماد
+                    # در این چرخه فقط توکن هدر می‌دهد، بدون اینکه اطلاعات
+                    # جدیدی وجود داشته باشد. مثل حالت «AI در دسترس نیست»،
+                    # همین چرخه WAIT در نظر گرفته می‌شود - هیچ معامله‌ای جعل
+                    # نمی‌شود و در چرخه‌ی بعدی که شرط بالا برقرار شود، AI
+                    # دوباره واقعاً صدا زده خواهد شد.
+                    signal = Signal(
+                        market=symbol, action=Action.WAIT,
+                        reason="صرفه‌جویی توکن: قیمت تغییر معناداری نکرده، تصمیم AI هنوز معتبر است",
+                        current_price=current_price_for_gate or 0.0,
+                    )
+                    log.debug(f"⏭️ [TOKEN-SAVE] AI call skipped for {symbol} this cycle (no significant change)")
             else:
                 # Fallback به استراتژی قانون‌محور
                 ticker = client.get_ticker(symbol)
@@ -390,7 +446,7 @@ def intelligence_loop(intelligence, notifier, portfolio_mgr, interval_seconds):
             time.sleep(60)
 
 
-def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
+def chat_loop(telegram, client, discovery, advisor, portfolio_mgr, risk_mgr=None):
     engine = MarketIntelligence(settings)
     watchlist = [a.strip().upper() for a in settings.watchlist if isinstance(settings.watchlist, list)]
     handler = ChatHandler(
@@ -400,6 +456,11 @@ def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
         watchlist=watchlist,
         advisor=advisor,
         portfolio_mgr=portfolio_mgr,
+        # ===== اصلاح ریشه‌ای: قبلاً risk_mgr اصلاً به chat_loop/ChatHandler
+        # پاس داده نمی‌شد، پس پاسخ‌های چت (مثل «چی بخرم؟») هیچ‌وقت از آخرین
+        # Guardrail عبور نمی‌کردند - این خط همان risk_mgr واقعی حلقه‌ی اصلی
+        # معاملات را به مسیر چت هم وصل می‌کند. =====
+        risk_mgr=risk_mgr,
     )
     offset = None
     log.info("🤖 Telegram chat handler started")
@@ -555,7 +616,7 @@ def main():
     if settings.telegram_chat_enabled and telegram.enabled:
         threading.Thread(
             target=chat_loop,
-            args=(telegram, client, discovery, advisor, portfolio_mgr),
+            args=(telegram, client, discovery, advisor, portfolio_mgr, risk_mgr),
             daemon=True,
             name="telegram-chat",
         ).start()

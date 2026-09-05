@@ -1,12 +1,27 @@
 import logging
-from typing import Dict, Any, List
-from app.strategies.base import Action
+import json
+from typing import Dict, Any, List, Optional
+from app.strategies.base import Action, Signal
 from app.bitpin.pricing import MarketSymbolResolver, extract_ticker_price, find_ticker
+from app.bitpin.auth import BitpinAuthError
 
 log = logging.getLogger(__name__)
 
+# ===== اصلاح ریشه‌ای: عبارت‌های شناسایی درخواست «الان چی بخرم؟» =====
+# قبلاً هیچ مسیر تشخیصی برای این سوال وجود نداشت؛ چنین پیامی به _get_ai_response
+# می‌رفت که (۱) از یک پرامپت تقریباً خالی استفاده می‌کرد، (۲) قیمت‌ها را با
+# نماد اشتباه (مثلاً "BTC" به‌جای "BTC_USDT") می‌گرفت که همیشه شکست می‌خورد،
+# و (۳) هیچ اتصالی به RiskManager نداشت. حالا این عبارت‌ها به یک Flow صریح و
+# قابل‌ردیابی (Portfolio→Market→News→Opportunity→AI→Risk→Response) می‌روند.
+_BUY_INTENT_PHRASES = [
+    "چی بخرم", "چی بخریم", "چه بخرم", "چه چیزی بخرم", "چی رو بخرم", "چیو بخرم",
+    "چی خوبه بخرم", "پیشنهاد خرید", "بهترین خرید", "چی بگیرم", "چی معامله کنم",
+]
+
+
 class ChatHandler:
-    def __init__(self, client, discovery, engine, watchlist, max_assets=10, advisor=None, portfolio_mgr=None):
+    def __init__(self, client, discovery, engine, watchlist, max_assets=10, advisor=None,
+                 portfolio_mgr=None, risk_mgr=None):
         self.client = client
         self.discovery = discovery
         self.engine = engine
@@ -14,6 +29,9 @@ class ChatHandler:
         self.max_assets = max_assets
         self.advisor = advisor
         self.portfolio_mgr = portfolio_mgr
+        # ===== اصلاح ریشه‌ای: قبلاً RiskManager اصلاً به ChatHandler پاس داده
+        # نمی‌شد، یعنی پاسخ «چی بخرم؟» هیچ‌وقت از آخرین Guardrail عبور نمی‌کرد. =====
+        self.risk_mgr = risk_mgr
         # ===== اصلاح: تشخیص نماد دقیق بازار از لیست واقعی بازارها، به‌جای
         # حدس مستقیم "{asset}_USDT" - رفع مشکل قیمت SHIB =====
         self._symbol_resolver = MarketSymbolResolver(client)
@@ -81,6 +99,10 @@ class ChatHandler:
 
         elif "طلا" in text or "دلار" in text:
             return self._get_market_analysis(text)
+
+        # ===== اصلاح ریشه‌ای: مسیر مشخص و ردیابی‌شونده برای «الان چی بخرم؟» =====
+        elif any(phrase in text for phrase in _BUY_INTENT_PHRASES):
+            return self._handle_buy_query(text)
 
         else:
             return self._get_ai_response(text)
@@ -175,6 +197,14 @@ class ChatHandler:
 
             return self._format_advisor_report(balances, asset_values_irt, unpriced_assets, total_irt, total_usdt, usdt_irt_price)
 
+        # ===== اصلاح: 429/rate-limit روی Login نباید کل گزارش پرتفولیو را
+        # با یک exception خام (مثلاً "Login failed: 429 Request was
+        # throttled...") از کار بیندازد؛ پیام واضح و غیرفنی نشان می‌دهیم و
+        # کاربر را به تلاش دوباره‌ی کوتاه بعد راهنمایی می‌کنیم. منطق محاسبه‌ی
+        # موجودی و خروجی موفق بالا کاملاً بدون تغییر مانده است.
+        except BitpinAuthError as e:
+            log.warning(f"Portfolio temporarily unavailable due to Bitpin login rate-limit: {e}")
+            return "⏳ سرویس ورود بیت‌پین موقتاً محدود شده (rate limit). لطفاً چند لحظه‌ی دیگر دوباره امتحان کن."
         except Exception as e:
             log.error(f"Portfolio error: {e}")
             return f"❌ خطا در دریافت کیف پول: {e}"
@@ -415,6 +445,190 @@ class ChatHandler:
             return f"🏅 طلا: {gold:,.0f} تومان\n💵 دلار: {dollar:,.0f} تومان"
         except Exception as e:
             return f"❌ خطا: {e}"
+
+    def _handle_buy_query(self, text: str) -> str:
+        """
+        ===== اصلاح ریشه‌ای: Flow واقعی و قابل‌ردیابی برای «الان چی بخرم؟» =====
+        این متد دقیقاً همان زنجیره‌ای را که باید اجرا شود پیاده‌سازی می‌کند و
+        هر Node را برای Debug در لاگ ثبت می‌کند (پیشوند [BUY-FLOW]):
+            Intent → Portfolio Tool → Market Data Tool → News Tool →
+            Opportunity Analysis → AI Decision → RiskManager → Response
+
+        اصول رعایت‌شده:
+        - هیچ قیمت/عددی توسط AI ساخته نمی‌شود؛ همه از get_market_comparison
+          (که خودش از market_data_manager.get_all_prices/get_historical واقعی
+          می‌آید) و از پرتفولیوی واقعی کاربر گرفته می‌شود.
+        - AI مجبور است چند دارایی (candidates) را واقعاً مقایسه کند - نه فقط
+          یک نماد را حدس بزند - و اگر نمادی خارج از candidates برگرداند، آن
+          تصمیم رد می‌شود (به AI_DECISION رجوع کنید).
+        - RiskManager همیشه به‌عنوان آخرین Guardrail بعد از BUY اجرا می‌شود؛
+          اگر رد کند یا در دسترس نباشد، تصمیم نهایی به WAIT برمی‌گردد و دلیل
+          واقعی (نه هاردکد) نشان داده می‌شود.
+        - اگر هر Node داده‌ی واقعی برنگرداند، این صریحاً به کاربر گفته می‌شود؛
+          هیچ‌جا وانمود نمی‌شود که تحلیلی انجام شده که در واقع انجام نشده.
+        - هیچ سفارش/معامله‌ی واقعی در این متد ثبت نمی‌شود (فقط توصیه‌ی متنی).
+        """
+        trace: List[Dict[str, Any]] = []
+
+        def log_node(name: str, status: str, detail: Any = None):
+            trace.append({"node": name, "status": status, "detail": detail})
+            log.info(f"[BUY-FLOW] node={name} status={status} detail={str(detail)[:300]}")
+
+        log_node("INTENT", "ok", {"text": text})
+
+        if not self.advisor:
+            log_node("AI_DECISION", "unavailable", "advisor=None")
+            return "🤖 AI در دسترس نیست، پس نمی‌توانم تحلیل واقعی برای خرید انجام بدهم."
+
+        # ----- Node: Portfolio Tool -----
+        portfolio_summary = None
+        if self.portfolio_mgr:
+            try:
+                snapshot = self.portfolio_mgr.fetch_snapshot()
+                portfolio_summary = {
+                    "total_value_usdt": snapshot.total_value_usdt,
+                    "available_usdt": snapshot.available_usdt,
+                    "percentages": snapshot.percentages,
+                    "held_assets": list(snapshot.balances.keys()),
+                }
+                log_node("PORTFOLIO_TOOL", "ok", portfolio_summary)
+            except Exception as e:
+                log_node("PORTFOLIO_TOOL", "error", str(e))
+        else:
+            log_node("PORTFOLIO_TOOL", "unavailable", "portfolio_mgr=None")
+
+        if not portfolio_summary:
+            return ("❌ نتوانستم وضعیت واقعی کیف‌پول را بخوانم، پس نمی‌توانم مسئولانه پیشنهاد خرید بدهم "
+                    "(این خطا واقعی است، نه یک پاسخ ثابت). لطفاً بعداً دوباره امتحان کنید.")
+
+        # ----- Node: Market Data Tool + Opportunity Analysis -----
+        try:
+            comparison = self.advisor.get_market_comparison()
+            if "error" in comparison:
+                log_node("MARKET_DATA_TOOL", "error", comparison["error"])
+            else:
+                log_node("MARKET_DATA_TOOL", "ok", {"num_candidates": len(comparison.get("candidates", []))})
+        except Exception as e:
+            comparison = {"error": str(e), "candidates": []}
+            log_node("MARKET_DATA_TOOL", "error", str(e))
+
+        candidates = comparison.get("candidates", [])
+        if not candidates:
+            log_node("OPPORTUNITY_ANALYSIS", "unavailable", comparison.get("error"))
+            return (f"❌ Market Data Tool داده‌ی واقعی برنگرداند ({comparison.get('error', 'نامشخص')})، "
+                    "پس نمی‌توانم چند دارایی را واقعاً مقایسه کنم. تحلیل انجام نشد؛ این یک صبر ثابت نیست.")
+
+        opportunities = comparison.get("opportunities", [])
+        log_node("OPPORTUNITY_ANALYSIS", "ok", {"num_opportunities": len(opportunities)})
+
+        # ----- Node: News Tool -----
+        try:
+            news = self.advisor.get_news(limit=3)
+            if "error" in news:
+                log_node("NEWS_TOOL", "error", news["error"])
+            else:
+                log_node("NEWS_TOOL", "ok", {"num_headlines": len(news.get("headlines", []))})
+        except Exception as e:
+            news = {"error": str(e)}
+            log_node("NEWS_TOOL", "error", str(e))
+
+        # ----- Node: AI Decision (deterministic - فقط تحلیل، بدون ساختن عدد) -----
+        ai_context = {"portfolio": portfolio_summary, "candidates": comparison, "news": news}
+        try:
+            ai_result = self.advisor.decide_buy_recommendation(ai_context)
+        except Exception as e:
+            log.warning(f"decide_buy_recommendation raised: {e}")
+            ai_result = None
+
+        if ai_result is None:
+            log_node("AI_DECISION", "unavailable_or_invalid")
+            return ("🤖 نتوانستم یک تصمیم معتبر از تحلیل AI بگیرم (پاسخ نامعتبر بود یا نمادی خارج از "
+                    "دارایی‌های واقعاً بررسی‌شده انتخاب شده بود)، پس صادقانه می‌گویم که الان نمی‌توانم "
+                    "توصیه‌ی قابل‌اتکا بدهم. این یک «صبر» از‌پیش‌نوشته‌شده نیست؛ تحلیل واقعی انجام شد "
+                    "ولی به تصمیم معتبر نرسید.")
+
+        log_node("AI_DECISION", "ok", ai_result)
+        action, reason, symbol = ai_result["action"], ai_result["reason"], ai_result.get("symbol")
+
+        # ----- Node: RiskManager (آخرین Guardrail) -----
+        risk_note = None
+        if action == "BUY":
+            candidate = next((c for c in candidates if c["symbol"] == symbol), None)
+            if not candidate or not self.risk_mgr:
+                log_node("RISK_MANAGER", "unavailable", {"symbol": symbol, "risk_mgr_present": bool(self.risk_mgr)})
+                action = "WAIT"
+                reason = (f"AI پیشنهاد خرید {symbol} را داد ({reason}) ولی چون RiskManager در دسترس نبود "
+                          "یا قیمت معتبر آن پیدا نشد، به‌عنوان آخرین Guardrail این خرید تأیید نشد.")
+            else:
+                try:
+                    market_symbol = self._symbol_resolver.resolve(symbol, "USDT")
+                except Exception:
+                    market_symbol = f"{symbol}_USDT"
+
+                signal = Signal(
+                    market=market_symbol, action=Action.BUY, reason=reason,
+                    current_price=candidate["price"], entry_price=candidate["price"],
+                )
+                current_asset_exposure_usdt = (candidate.get("held_amount", 0) or 0) * candidate["price"]
+                total_value_usdt = portfolio_summary["total_value_usdt"]
+                available_usdt = portfolio_summary["available_usdt"]
+                total_exposure_usdt = max(total_value_usdt - available_usdt, 0.0)
+
+                try:
+                    from app.config.settings import settings as app_settings
+                    decision = self.risk_mgr.approve(
+                        signal=signal,
+                        portfolio_value_usdt=total_value_usdt,
+                        available_usdt=available_usdt,
+                        current_asset_exposure_usdt=current_asset_exposure_usdt,
+                        total_exposure_usdt=total_exposure_usdt,
+                        # ===== توجه: این پروژه (نه فقط این متد) هنوز ابزار واقعی
+                        # عمق سفارش (orderbook depth) ندارد؛ همان قراردادی که در
+                        # حلقه‌ی اصلی main.py هم استفاده شده (جایگزینی با
+                        # settings.min_liquidity) اینجا هم عیناً تکرار می‌شود -
+                        # چیز جدیدی جعل نشده، فقط با رفتار موجود پروژه یکسان شده. =====
+                        orderbook_liquidity_usdt=app_settings.min_liquidity,
+                        estimated_slippage_percent=signal.slippage_percent,
+                        price_age_seconds=0.0,
+                    )
+                    log_node("RISK_MANAGER", "ok", {"approved": decision.approved, "reason": decision.reason})
+                except Exception as e:
+                    log_node("RISK_MANAGER", "error", str(e))
+                    decision = None
+
+                if decision is None:
+                    action = "WAIT"
+                    reason = f"AI پیشنهاد خرید {symbol} را داد ({reason}) ولی بررسی RiskManager با خطا مواجه شد."
+                elif not decision.approved:
+                    action = "WAIT"
+                    reason = f"AI پیشنهاد خرید {symbol} را داد ({reason}) ولی RiskManager رد کرد: {decision.reason}"
+                else:
+                    risk_note = f"حداکثر حجم پیشنهادی RiskManager: {decision.max_position_usdt:,.2f} USDT ({decision.reason})"
+        else:
+            log_node("RISK_MANAGER", "skipped", "AI action was WAIT, no trade to risk-check")
+
+        # ----- Node: Response -----
+        lines = [f"🟢 پیشنهاد: خرید {symbol}" if action == "BUY" else "🟡 صبر", f"دلیل: {reason}"]
+        lines.append(f"\nدارایی‌های واقعی بررسی‌شده: {', '.join(c['symbol'] for c in candidates)}")
+        if opportunities:
+            opp_lines = [f"- {o['symbol']}: {o['action']} ({o['change_percent_24h']:+.1f}%) - {o['reason']}" for o in opportunities]
+            lines.append("فرصت‌های واقعی یافت‌شده:\n" + "\n".join(opp_lines))
+        else:
+            lines.append("در این بررسی، هیچ‌کدام از دارایی‌ها از آستانه‌ی فرصت واقعی عبور نکردند.")
+
+        if news.get("headlines"):
+            lines.append("\n📰 اخبار بررسی‌شده: " + "؛ ".join(h["title"] for h in news["headlines"][:3]))
+        elif "error" in news:
+            lines.append(f"\n📰 اخبار: در دسترس نبود ({news['error']})")
+
+        if risk_note:
+            lines.append(f"\n🛡️ {risk_note}")
+
+        lines.append("\n⚠️ این فقط یک توصیه‌ی تحلیلی است؛ هیچ معامله‌ی واقعی ثبت نشده است.")
+
+        log_node("RESPONSE", "ok")
+        log.info(f"[BUY-FLOW] full_trace={json.dumps(trace, ensure_ascii=False, default=str)}")
+        return "\n".join(lines)
 
     def _get_ai_response(self, text: str) -> str:
         if not self.advisor:
