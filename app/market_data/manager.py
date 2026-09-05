@@ -32,7 +32,7 @@ class MarketDataManager:
             log.warning("⚠️ Bitpin credentials missing, Bitpin provider disabled")
 
         # ۲. Brsapi Provider (طلا، دلار، سکه)
-        self.providers.append(BrsapiProvider(settings.brsapi_url))
+        self.providers.append(BrsapiProvider(settings.brsapi_url, settings.brsapi_key))
         log.info("✅ Brsapi provider initialized")
 
         # ۳. CoinGecko Provider (رمزارزهای خارجی)

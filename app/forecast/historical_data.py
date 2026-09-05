@@ -11,10 +11,13 @@ class HistoricalData:
     def __init__(self):
         # CoinGecko برای رمزارزها
         self.coingecko_base = "https://api.coingecko.com/api/v3"
-        # brsapi برای طلا و دلار
-        self.brsapi_url = "https://api.brsapi.ir/Market/Gold_Currency.php"
         # Cache برای کاهش درخواست‌ها
         self._cache = {}
+        # ===== اصلاح: به‌جای درخواست خام تکراری با آدرس/فیلدهای قدیمی و
+        # خراب BrsApi، از همون provider مشترک و مقاوم استفاده می‌کنیم =====
+        from app.config.settings import settings
+        from app.market_data.brsapi_provider import BrsapiProvider
+        self._brsapi = BrsapiProvider(settings.brsapi_url, settings.brsapi_key)
 
     def get_crypto_historical(self, symbol: str, days: int = 30, vs_currency: str = "usd") -> List[Dict]:
         """دریافت داده‌های تاریخی رمزارزها از CoinGecko"""
@@ -61,63 +64,58 @@ class HistoricalData:
             return []
 
     def get_gold_historical(self, days: int = 30) -> List[Dict]:
-        """دریافت داده‌های تاریخی طلا (از brsapi)"""
+        """
+        داده‌ی «تاریخی» طلا. brsapi تاریخچه‌ی واقعی رایگان نمی‌دهد، پس فقط
+        قیمت لحظه‌ای واقعی را می‌گیریم و حول آن نوسان شبیه‌سازی‌شده می‌سازیم
+        (این داده synthetic است و در گزارش نهایی هم صریحاً همین‌طور برچسب
+        می‌خورد - نه به عنوان یک پیش‌بینی مطمئن).
+        """
         cache_key = f"gold_{days}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         try:
-            # brsapi داده تاریخی مستقیم ندارد، از داده لحظه‌ای با نوسان‌گیری استفاده می‌کنیم
-            resp = requests.get(self.brsapi_url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                current_price = data.get("price_gold", 0)
-                if current_price == 0:
-                    return []
+            current_price = self._brsapi.get_price("GOLD")
+            if not current_price:
+                return []
 
-                # ساخت داده‌های تاریخی شبیه‌سازی‌شده (برای نمونه)
-                import random
-                result = []
-                now = datetime.now()
-                for i in range(days, 0, -1):
-                    price = current_price * (1 + random.uniform(-0.02, 0.02))
-                    timestamp = (now - timedelta(days=i)).timestamp() * 1000
-                    result.append({"time": timestamp, "price": price})
+            import random
+            result = []
+            now = datetime.now()
+            for i in range(days, 0, -1):
+                price = current_price * (1 + random.uniform(-0.02, 0.02))
+                timestamp = (now - timedelta(days=i)).timestamp() * 1000
+                result.append({"time": timestamp, "price": price})
 
-                self._cache[cache_key] = result
-                log.info(f"📊 Generated {len(result)} historical prices for Gold")
-                return result
-            return []
+            self._cache[cache_key] = result
+            log.info(f"📊 Generated {len(result)} historical prices for Gold")
+            return result
         except Exception as e:
             log.error(f"Gold historical error: {e}")
             return []
 
     def get_dollar_historical(self, days: int = 30) -> List[Dict]:
-        """دریافت داده‌های تاریخی دلار (از brsapi)"""
+        """داده‌ی «تاریخی» دلار - همان توضیح بالا (synthetic حول قیمت واقعی لحظه‌ای)"""
         cache_key = f"dollar_{days}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         try:
-            resp = requests.get(self.brsapi_url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                current_price = data.get("price_dollar", 0)
-                if current_price == 0:
-                    return []
+            current_price = self._brsapi.get_price("USD")
+            if not current_price:
+                return []
 
-                import random
-                result = []
-                now = datetime.now()
-                for i in range(days, 0, -1):
-                    price = current_price * (1 + random.uniform(-0.015, 0.015))
-                    timestamp = (now - timedelta(days=i)).timestamp() * 1000
-                    result.append({"time": timestamp, "price": price})
+            import random
+            result = []
+            now = datetime.now()
+            for i in range(days, 0, -1):
+                price = current_price * (1 + random.uniform(-0.015, 0.015))
+                timestamp = (now - timedelta(days=i)).timestamp() * 1000
+                result.append({"time": timestamp, "price": price})
 
-                self._cache[cache_key] = result
-                log.info(f"📊 Generated {len(result)} historical prices for Dollar")
-                return result
-            return []
+            self._cache[cache_key] = result
+            log.info(f"📊 Generated {len(result)} historical prices for Dollar")
+            return result
         except Exception as e:
             log.error(f"Dollar historical error: {e}")
             return []

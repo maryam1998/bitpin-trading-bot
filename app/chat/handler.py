@@ -113,7 +113,8 @@ class ChatHandler:
             # ========================================================
 
             total_irt = 0.0
-            asset_values = {}
+            asset_values_irt = {}
+            unpriced_assets = []  # قانون ۱۱: به‌جای فرض صفر، این‌ها را جدا اعلام می‌کنیم
 
             for asset, data in balances.items():
                 balance = data["balance"]
@@ -122,7 +123,7 @@ class ChatHandler:
                 elif asset == "USDT":
                     value_irt = balance * usdt_irt_price
                 else:
-                    # قیمت ارز به USDT
+                    value_irt = None
                     try:
                         ticker_asset = self.client.get_ticker(f"{asset}_USDT")
                         if isinstance(ticker_asset, list):
@@ -131,36 +132,139 @@ class ChatHandler:
                         if price_usdt > 0:
                             value_irt = balance * price_usdt * usdt_irt_price
                         else:
-                            # اگر بازار USDT وجود نداشت، از IRT استفاده کن
                             ticker_irt = self.client.get_ticker(f"{asset}_IRT")
                             if isinstance(ticker_irt, list):
                                 ticker_irt = next((t for t in ticker_irt if t.get("symbol") == f"{asset}_IRT"), {})
                             price_irt = float(ticker_irt.get("price", 0))
-                            value_irt = balance * price_irt if price_irt > 0 else 0.0
-                    except:
-                        value_irt = 0.0
+                            if price_irt > 0:
+                                value_irt = balance * price_irt
+                    except Exception:
+                        value_irt = None
 
-                asset_values[asset] = value_irt
+                if value_irt is None:
+                    unpriced_assets.append(asset)
+                    continue
+
+                asset_values_irt[asset] = value_irt
                 total_irt += value_irt
 
             total_usdt = total_irt / usdt_irt_price if usdt_irt_price > 0 else 0.0
 
-            lines = ["📊 **وضعیت کیف پول:**"]
-            for asset, data in balances.items():
-                value_usdt = asset_values.get(asset, 0.0) / usdt_irt_price
-                # نمایش موجودی قابل استفاده به‌روز (محاسبه‌شده)
-                lines.append(
-                    f"• {asset}: {data['balance']:.2f} (قابل استفاده: {data['available']:.2f}) "
-                    f"≈ {value_usdt:.2f} USDT"
-                )
-            lines.append(f"\n💰 مجموع: {total_usdt:.2f} USDT")
-            lines.append(f"💰 معادل تومان: {total_irt:,.0f} IRT")
-
-            return "\n".join(lines)
+            return self._format_advisor_report(balances, asset_values_irt, unpriced_assets, total_irt, total_usdt, usdt_irt_price)
 
         except Exception as e:
             log.error(f"Portfolio error: {e}")
             return f"❌ خطا در دریافت کیف پول: {e}"
+
+    # ===== نمادها/ایموجی نمایش هر دارایی =====
+    _ASSET_EMOJI = {
+        "USDT": "💵", "IRT": "🇮🇷", "ETH": "💎", "BTC": "🟠", "XRP": "🟣",
+        "TRX": "🔵", "SHIB": "🐕", "DOGE": "🐶", "BNB": "🟡", "ADA": "🔷",
+        "SOL": "🟪", "DOT": "⚪", "LINK": "🔗",
+    }
+    _STABLE_ASSETS = {"USDT", "IRT"}
+
+    @staticmethod
+    def _format_balance(balance: float) -> str:
+        """موجودی رو بدون صفرهای اضافی نشون می‌ده (بدون آسیب زدن به ارقام غیرصفر)"""
+        if balance == int(balance):
+            return f"{int(balance):,}"
+        text = f"{balance:,.6f}".rstrip("0")
+        return text.rstrip(".") if text.endswith(".") else text
+
+    def _format_advisor_report(self, balances, asset_values_irt, unpriced_assets,
+                                total_irt, total_usdt, usdt_irt_price) -> str:
+        """
+        گزارش کیف پول به سبک «مشاور مالی»: هر دارایی در یک بلوک جدا، مرتب‌شده
+        بر اساس ارزش، به‌همراه یک تحلیل ساده و صادقانه از ترکیب پرتفولیو.
+        هیچ عددی این‌جا حدس زده نمی‌شود - همه از asset_values_irt (محاسبه‌شده
+        از قیمت واقعی بیت‌پین) می‌آیند.
+        """
+        lines = []
+        lines.append("💰 **وضعیت سرمایه**")
+        lines.append("━━━━━━━━━━━━")
+        lines.append(f"ارزش کل: **{total_usdt:,.2f} USDT**")
+        lines.append(f"معادل: **حدود {total_irt / 1_000_000:,.1f} میلیون تومان**")
+        lines.append("")
+        lines.append("📊 **دارایی‌های من**")
+        lines.append("━━━━━━━━━━━━")
+
+        sorted_assets = sorted(asset_values_irt.items(), key=lambda kv: kv[1], reverse=True)
+        for asset, value_irt in sorted_assets:
+            value_usdt = value_irt / usdt_irt_price if usdt_irt_price > 0 else 0.0
+            pct = (value_irt / total_irt * 100) if total_irt > 0 else 0.0
+            emoji = self._ASSET_EMOJI.get(asset, "🔸")
+            balance = balances[asset]["balance"]
+            lines.append(f"\n{emoji} **{asset}**")
+            lines.append(f"موجودی: {self._format_balance(balance)}")
+            if value_usdt < 0.01:
+                lines.append("ارزش: کمتر از 0.01 USDT")
+                lines.append("سهم: ناچیز")
+            else:
+                lines.append(f"ارزش: ≈ {value_usdt:,.2f} USDT")
+                lines.append(f"سهم: **{pct:.1f}٪**")
+
+        if unpriced_assets:
+            lines.append("\n⚠️ قیمت این دارایی‌ها الان در دسترس نبود (در جمع کل لحاظ نشده‌اند): " + "، ".join(unpriced_assets))
+
+        # ===== تحلیل ترکیب پرتفولیو (کاملاً بر اساس اعداد واقعی بالا، بدون حدس بازار) =====
+        cash_irt = sum(v for a, v in asset_values_irt.items() if a in self._STABLE_ASSETS)
+        cash_ratio = (cash_irt / total_irt * 100) if total_irt > 0 else 0.0
+        volatile = [(a, v) for a, v in asset_values_irt.items() if a not in self._STABLE_ASSETS]
+        top_volatile = max(volatile, key=lambda kv: kv[1]) if volatile else None
+        top_volatile_pct = (top_volatile[1] / total_irt * 100) if (top_volatile and total_irt > 0) else 0.0
+
+        if cash_ratio >= 50:
+            liquidity = "🟢 خوب"
+        elif cash_ratio >= 20:
+            liquidity = "🟡 متوسط"
+        else:
+            liquidity = "🔴 پایین"
+
+        if top_volatile_pct >= 50:
+            diversity = "🔴 پایین (تمرکز زیاد روی یک دارایی)"
+        elif top_volatile_pct >= 25:
+            diversity = "🟡 متوسط"
+        else:
+            diversity = "🟢 خوب"
+
+        volatile_ratio = 100 - cash_ratio
+        if volatile_ratio >= 60:
+            risk_level = "🔴 بالا"
+        elif volatile_ratio >= 30:
+            risk_level = "🟡 متوسط"
+        else:
+            risk_level = "🟢 پایین"
+
+        lines.append("\n━━━━━━━━━━━━")
+        lines.append("🧠 **نظر مشاور**")
+        advisor_notes = []
+        advisor_notes.append(f"حدود {cash_ratio:.0f}٪ از سرمایه‌ت به‌صورت نقد (USDT/تومان) هست.")
+        if top_volatile:
+            advisor_notes.append(f"بیشترین تمرکز روی {top_volatile[0]} با حدود {top_volatile_pct:.0f}٪ از کل پرتفولیوئه.")
+        advisor_notes.append(f"سطح ریسک فعلی پرتفولیو: {risk_level.split()[-1]}.")
+        lines.append(" ".join(advisor_notes))
+
+        lines.append("\n🎯 **بهترین کار الان**")
+        if cash_ratio >= 50:
+            action = "🟡 صبر"
+            best_move = "بخش زیادی از سرمایه‌ت نقده، پس عجله‌ای برای خرید نیست؛ صبر کن یه فرصت واقعی (با /opportunities) پیدا بشه، بعد مرحله‌ای وارد شو."
+        elif top_volatile_pct >= 50:
+            action = "🔴 کاهش تمرکز"
+            best_move = f"بیشتر سرمایه‌ت روی {top_volatile[0]} متمرکزه؛ بهتره برای کاهش ریسک بخشی از پرتفولیو رو متنوع‌تر کنی."
+        else:
+            action = "🟡 صبر"
+            best_move = "ترکیب فعلی پرتفولیو نسبتاً متعادله؛ فعلاً نیازی به تغییر فوری نیست."
+        lines.append(f"{action}\n{best_move}")
+
+        lines.append("\n⚠️ **ریسک پرتفولیو**")
+        lines.append(f"{liquidity.split()[0]} نقدینگی: {liquidity.split()[1] if len(liquidity.split())>1 else ''}")
+        lines.append(f"{diversity.split()[0]} تنوع: {' '.join(diversity.split()[1:])}")
+        lines.append(f"{risk_level.split()[0]} ریسک فعلی: {risk_level.split()[1]}")
+
+        lines.append("\n💡 این یک تحلیل بر اساس ترکیب دارایی‌های توئه، نه پیش‌بینی بازار. برای سیگنال لحظه‌ای بازار، دستور /opportunities رو بزن.")
+
+        return "\n".join(lines)
 
     def _get_signal(self, symbol: str) -> str:
         if not self.advisor:
@@ -187,12 +291,14 @@ class ChatHandler:
 
     def _get_market_analysis(self, text: str) -> str:
         try:
-            import requests
-            resp = requests.get("https://api.brsapi.ir/Market/Gold_Currency.php", timeout=5)
-            data = resp.json()
-            gold = data.get("price_gold", 0)
-            dollar = data.get("price_dollar", 0)
-            return f"🏅 طلا: {gold:,} تومان\n💵 دلار: {dollar:,} تومان"
+            from app.market_data.brsapi_provider import BrsapiProvider
+            from app.config.settings import settings
+            provider = BrsapiProvider(settings.brsapi_url, settings.brsapi_key)
+            overview = provider.get_market_overview()
+            gold, dollar = overview.get("gold", 0), overview.get("dollar", 0)
+            if not gold and not dollar:
+                return "❌ قیمت طلا/دلار موقتاً در دسترس نیست (سرویس BrsApi پاسخ معتبر نداد)."
+            return f"🏅 طلا: {gold:,.0f} تومان\n💵 دلار: {dollar:,.0f} تومان"
         except Exception as e:
             return f"❌ خطا: {e}"
 

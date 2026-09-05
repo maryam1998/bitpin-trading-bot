@@ -83,7 +83,13 @@ class Settings:
     sms_phone_number: str = field(default_factory=lambda: os.getenv("SMS_PHONE_NUMBER", ""))
 
     # --- Market Data APIs ---
-    brsapi_url: str = field(default_factory=lambda: os.getenv("BRSAPI_URL", "https://api.brsapi.ir/Market/Gold_Currency.php"))
+    # ===== اصلاح: آدرس قدیمی Gold_Currency.php الان به یک کلید API نیاز دارد
+    # و بدون آن همیشه ۰ برمی‌گرداند. آدرس رایگانِ بدون‌نیاز-به-کلید جایگزین شد.
+    # اگر کلید Pro داری، BRSAPI_URL و BRSAPI_KEY را در تنظیمات ست کن.
+    brsapi_url: str = field(default_factory=lambda: os.getenv(
+        "BRSAPI_URL", "https://brsapi.ir/FreeTsetmcBourseApi/Api_Free_Gold_Currency_v2.json"
+    ))
+    brsapi_key: str = field(default_factory=lambda: os.getenv("BRSAPI_KEY", ""))
     coingecko_api_key: str = field(default_factory=lambda: os.getenv("COINGECKO_API_KEY", ""))
 
     # --- Strategy ---

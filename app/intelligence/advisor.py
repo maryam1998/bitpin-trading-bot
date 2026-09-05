@@ -50,13 +50,23 @@ class AIAdvisor:
                 log.warning(f"⚠️ AI_PROVIDER ناشناخته: {provider!r}؛ به عنوان سازگار با OpenAI فرض می‌شود.")
 
             # ===== اصلاح: مدل‌های OpenAI (gpt-...) روی Groq وجود ندارند =====
+            # ===== اصلاح ۲: llama-3.3-70b-versatile در Groq از ۱۶ اوت ۲۰۲۶
+            # کاملاً حذف شده (decommissioned) و دیگر جواب نمی‌دهد (404) =====
+            groq_deprecated_models = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+                                       "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct"}
             if provider == "groq" and settings.ai_model.lower().startswith("gpt-"):
                 log.warning(
                     f"⚠️ مدل {settings.ai_model!r} مخصوص OpenAI است و روی Groq کار نمی‌کند. "
-                    "به‌صورت خودکار به llama-3.3-70b-versatile تغییر داده شد. "
+                    "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد. "
                     "برای انتخاب مدل دیگر، AI_MODEL را در تنظیمات Groq مطابق مستندات Groq ست کنید."
                 )
-                settings.ai_model = "llama-3.3-70b-versatile"
+                settings.ai_model = "openai/gpt-oss-120b"
+            elif provider == "groq" and settings.ai_model in groq_deprecated_models:
+                log.warning(
+                    f"⚠️ مدل {settings.ai_model!r} توسط Groq حذف شده (decommissioned). "
+                    "به‌صورت خودکار به openai/gpt-oss-120b تغییر داده شد."
+                )
+                settings.ai_model = "openai/gpt-oss-120b"
 
             try:
                 if base_url:
