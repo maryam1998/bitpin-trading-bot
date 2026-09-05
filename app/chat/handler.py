@@ -15,6 +15,16 @@ class ChatHandler:
         self.portfolio_mgr = portfolio_mgr
 
     def handle(self, chat_id: str, text: str) -> str:
+        # ===== اصلاح: هیچ‌وقت نباید پاسخ کاملاً خالی/بی‌صدا برگردد =====
+        # قبلاً اگر یک خطای پیش‌بینی‌نشده در مسیر تشخیص دستور رخ می‌داد،
+        # کل حلقه‌ی چت متوقف می‌شد و کاربر هیچ پاسخی نمی‌گرفت (حتی پیام خطا).
+        try:
+            return self._route(text)
+        except Exception as e:
+            log.exception(f"خطای پیش‌بینی‌نشده در پردازش پیام: {text!r}")
+            return f"❌ یک خطای غیرمنتظره رخ داد: {e}"
+
+    def _route(self, text: str) -> str:
         text = text.strip().lower()
         if text in ["/start", "سلام", "hi"]:
             return "👋 سلام! من ربات تریدینگ هوشمند هستم.\nبرای مشاهده راهنما، /help را بفرستید."
@@ -22,7 +32,7 @@ class ChatHandler:
         elif text == "/help":
             return (
                 "📚 **راهنمای ربات:**\n"
-                "/portfolio - نمایش وضعیت کیف پول\n"
+                "/portfolio یا موجودی یا کیف پول - نمایش وضعیت کیف پول\n"
                 "/signal BTC - دریافت سیگنال برای بیت‌کوین\n"
                 "/analysis - تحلیل کلی بازار\n"
                 "/forecast BTC - پیش‌بینی قیمت ۳۰ روز آینده\n"
@@ -31,7 +41,10 @@ class ChatHandler:
                 "سوالات خود را به زبان فارسی بپرسید."
             )
 
-        elif text == "/portfolio" or text == "کیف پول":
+        # ===== اصلاح: «موجودی» و چند نام رایج دیگر هم باید کیف پول را نشان بدهند =====
+        # قبلاً فقط دقیقاً "/portfolio" یا "کیف پول" شناسایی می‌شد و هر چیز دیگری
+        # (مثل "موجودی") به مسیر چت آزاد با AI می‌رفت که نتیجه‌ی گیج‌کننده می‌داد.
+        elif text in ["/portfolio", "/wallet", "/balance", "کیف پول", "موجودی", "موجودیم", "wallet", "balance"]:
             return self._get_portfolio_info()
 
         elif text.startswith("/signal"):

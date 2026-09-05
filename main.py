@@ -414,7 +414,13 @@ def chat_loop(telegram, client, discovery, advisor, portfolio_mgr):
                 chat_id = str(message["chat"]["id"])
                 text = message["text"]
                 log.info(f"💬 Chat message from {chat_id}: {text}")
-                reply = handler.handle(chat_id, text)
+                try:
+                    reply = handler.handle(chat_id, text)
+                except Exception as e:
+                    # ===== اصلاح: حتی اگر ChatHandler هم خطای غیرمنتظره بدهد،
+                    # کاربر باید حداقل یک پیام خطا ببیند، نه سکوت کامل =====
+                    log.exception(f"❌ خطای پردازش پیام چت: {e}")
+                    reply = f"❌ خطا در پردازش پیام: {e}"
                 telegram.send_to(chat_id, reply)
             if not updates:
                 time.sleep(1)
