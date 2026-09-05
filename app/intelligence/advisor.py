@@ -1,12 +1,100 @@
 import hashlib
 import logging
 import json
+import re
 import time
 from typing import Dict, Any, List, Optional
 from openai import OpenAI, RateLimitError, APIStatusError
 from app.strategies.base import Signal, Action
 
 log = logging.getLogger(__name__)
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """
+    ===== اصلاح ریشه‌ای: استخراج مقاوم JSON از خروجی مدل =====
+    قبلاً فقط اولین "{" و آخرین "}" در کل متن پیدا می‌شد که با هر متن اضافه
+    (مثلاً محصور در فنس Markdown ```json ... ``` یا یک "}" اضافه در جای
+    دیگر پیام) خراب می‌شد. اینجا:
+    ۱) فنس‌های Markdown حذف می‌شوند.
+    ۲) از اولین "{" شروع می‌شود و با شمارش دقیق آکولاد باز/بسته (با نادیده
+       گرفتن آکولادهای داخل رشته‌ها) اولین شیء JSON کامل و متوازن استخراج
+       می‌شود - نه صرفاً فاصله‌ی بین اولین و آخرین آکولاد کل متن.
+    برمی‌گرداند: رشته‌ی JSON استخراج‌شده، یا None اگر هیچ شیء متوازنی پیدا نشد.
+    """
+    if not text:
+        return None
+    cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start:i + 1]
+    return None
+
+
+def _normalize_symbol(raw: Optional[str], candidate_symbols) -> Optional[str]:
+    """
+    ===== اصلاح ریشه‌ای: normalize نام نماد قبل از اعتبارسنجی =====
+    مدل ممکن است نماد را به شکل‌های مختلف برگرداند (BTC، BTC/USDT، BTC_USDT،
+    btc-usdt، ...). اینجا همه به نماد پایه‌ی بزرگ‌حرف (مثل "BTC") نگاشته
+    می‌شود و سپس با نمادهایی که واقعاً بررسی شده‌اند (candidate_symbols)
+    مطابقت داده می‌شود. اگر بعد از normalize هم داخل candidates نبود، None
+    برگردانده می‌شود (رد می‌شود) - هرگز حدس زده یا ساخته نمی‌شود.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    base = raw.strip().upper()
+    for sep in ("/", "_", "-"):
+        if sep in base:
+            base = base.split(sep)[0]
+            break
+    else:
+        if base.endswith("USDT") and base != "USDT":
+            base = base[:-4]
+    return base if base in candidate_symbols else None
+
+
+# ===== اصلاح ریشه‌ای: JSON Schema برای Structured Output (وقتی SDK/پرووایدر
+# پشتیبانی کند). این همان ساختار SYSTEM_PROMPT_BUY_DECISION را به‌صورت schema
+# رسمی توصیف می‌کند تا مدل (در پرووایدرهایی که از آن پشتیبانی می‌کنند) اصلاً
+# نتواند خروجی خارج از این ساختار تولید کند. اگر پرووایدر پشتیبانی نکند،
+# _call_llm خودش یک‌بار بدون این تنظیم دوباره تلاش می‌کند و Parser مقاوم
+# (_extract_json_object) همچنان متن آزاد را می‌فهمد. =====
+BUY_DECISION_JSON_SCHEMA = {
+    "name": "buy_decision",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["BUY", "WAIT", "SELL"]},
+            "symbol": {"type": ["string", "null"]},
+            "reason": {"type": "string"},
+            "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        },
+        "required": ["decision", "symbol", "reason", "confidence"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
 
 
 class _StateCache:
@@ -107,20 +195,30 @@ OPPORTUNITY_SYMBOLS = ["BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", 
 MIN_OPPORTUNITY_CHANGE_PERCENT = 5.0
 
 # ===== پرامپت AI Decision برای فلوی «الان چی بخرم؟» (deterministic، بدون tool-calling) =====
+# ===== اصلاح ریشه‌ای: schema خروجی به {decision, symbol, reason, confidence}
+# تغییر کرد (به‌جای {action, symbol, reason}) تا با Parser جدید و اعتبارسنجی
+# دقیق‌تر symbol/confidence هماهنگ باشد؛ symbol باید به‌صورت "SYMBOL/USDT"
+# باشد که در _normalize_symbol به نماد پایه normalize می‌شود. =====
 SYSTEM_PROMPT_BUY_DECISION = """شما یک تحلیلگر معاملاتی هستید. به شما یک لیست از چند دارایی واقعی
 (candidates) به همراه قیمت لحظه‌ای، درصد تغییر ۲۴ ساعته، وضعیت پرتفولیوی کاربر و عناوین اخبار داده
-می‌شود. باید بگویید که آیا الان یک فرصت خرید معتبر بین همین دارایی‌ها وجود دارد یا نه.
+می‌شود. باید بگویید که آیا الان یک فرصت خرید یا فروش معتبر بین همین دارایی‌ها وجود دارد یا نه.
 
 قوانین اجباری:
 1. WAIT پیش‌فرض نیست. اگر یکی از candidates واقعاً افت قیمت قابل‌توجه (is_opportunity=true, action=BUY)
-   داشت، باید همان را با اکشن BUY انتخاب کنی، مگر اینکه دلیل روشنی (مثلاً خبر بد مرتبط) علیه آن باشد.
+   داشت، باید همان را با decision=BUY انتخاب کنی. اگر یکی از دارایی‌های نگه‌داری‌شده رشد قابل‌توجه
+   (is_opportunity=true, action=SELL) داشت، مجازی decision=SELL بدهی. WAIT فقط زمانی مجاز است که
+   بررسی واقعی هیچ فرصت روشنی نشان ندهد.
 2. باید حداقل چند candidate را با هم مقایسه کنی، نه اینکه فقط اولی را بدون بررسی انتخاب/رد کنی.
-3. symbol فقط می‌تواند یکی از نمادهای موجود در candidates باشد؛ هرگز نماد یا عددی که در ورودی نیامده
-   نساز یا حدس نزن.
+3. symbol فقط می‌تواند یکی از نمادهای موجود در candidates باشد، به‌صورت "SYMBOL/USDT" (مثلاً
+   "BTC/USDT")؛ هرگز نماد یا عددی که در ورودی نیامده نساز یا حدس نزن. اگر decision=WAIT بود، symbol
+   باید null باشد.
 4. اگر به WAIT رسیدی، در reason دقیقاً بگو چرا هیچ‌کدام از candidates فرصت معتبری نبودند (با اشاره به
    درصد تغییر واقعی‌شان)، نه یک جمله‌ی کلی و تکراری.
-5. فقط و فقط یک JSON با این ساختار برگردان، بدون هیچ متن اضافه قبل یا بعد آن:
-{"action": "BUY" | "WAIT", "symbol": "<یکی از candidates یا null>", "reason": "<دلیل به فارسی>"}
+5. confidence باید یک عدد صحیح بین ۰ تا ۱۰۰ باشد که میزان اطمینان واقعی‌ات به همین decision را (بر
+   اساس قدرت سیگنال در candidates) نشان می‌دهد؛ عدد دلبخواه یا همیشه‌ثابت نباشد.
+6. فقط و فقط یک JSON با دقیقاً این ساختار برگردان - بدون ```json، بدون هیچ متن دیگری قبل یا بعد آن:
+{"decision": "BUY" | "WAIT" | "SELL", "symbol": "SYMBOL/USDT یا null", "reason": "<دلیل به فارسی>",
+ "confidence": <عدد صحیح بین 0 تا 100>}
 """
 
 PROVIDER_BASE_URLS = {
@@ -235,7 +333,8 @@ class AIAdvisor:
 
     def _call_llm(self, *, node: str, model: str, messages: List[Dict[str, Any]],
                   max_tokens: int, temperature: float,
-                  tools: Optional[List[Dict[str, Any]]] = None) -> Optional[Any]:
+                  tools: Optional[List[Dict[str, Any]]] = None,
+                  response_format: Optional[Dict[str, Any]] = None) -> Optional[Any]:
         """
         ===== نقطه‌ی مرکزی همه‌ی فراخوانی‌های LLM =====
         - Token usage هر درخواست را در لاگ (Debug/Info) ثبت می‌کند.
@@ -256,18 +355,24 @@ class AIAdvisor:
             kwargs_base["tools"] = tools
             kwargs_base["tool_choice"] = "auto"
 
+        def _do_call(client, attempt_model, tag, use_response_format: bool):
+            call_kwargs = dict(kwargs_base)
+            if use_response_format and response_format is not None:
+                call_kwargs["response_format"] = response_format
+            response = client.chat.completions.create(model=attempt_model, **call_kwargs)
+            usage = getattr(response, "usage", None)
+            if usage:
+                log.info(
+                    f"📊 [TOKEN-USAGE] node={node} model={attempt_model} ({tag}) "
+                    f"prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
+                    f"total={usage.total_tokens}"
+                )
+            return response
+
         last_error = None
         for client, attempt_model, tag in attempts:
             try:
-                response = client.chat.completions.create(model=attempt_model, **kwargs_base)
-                usage = getattr(response, "usage", None)
-                if usage:
-                    log.info(
-                        f"📊 [TOKEN-USAGE] node={node} model={attempt_model} ({tag}) "
-                        f"prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
-                        f"total={usage.total_tokens}"
-                    )
-                return response
+                return _do_call(client, attempt_model, tag, use_response_format=True)
             except RateLimitError as e:
                 last_error = e
                 log.warning(
@@ -282,6 +387,23 @@ class AIAdvisor:
                 if getattr(e, "status_code", None) == 429:
                     log.warning(f"⏳ [RATE-LIMIT] node={node} model={attempt_model} ({tag}) خطای 429: {e}")
                     continue
+                # ===== اصلاح ریشه‌ای: اگر response_format (Structured Output/JSON
+                # Schema) باعث خطا شده - برخی پرووایدرها (Groq/OpenRouter/Together)
+                # از آن پشتیبانی نمی‌کنند - همان کلاینت/مدل را یک‌بار دیگر بدون
+                # response_format امتحان کن؛ Parser مقاوم متن (_extract_json_object)
+                # همچنان خروجی آزاد را می‌فهمد. این AI Decision را کامل متوقف
+                # نمی‌کند فقط به‌خاطر عدم پشتیبانی از یک پارامتر اختیاری. =====
+                if response_format is not None:
+                    log.warning(
+                        f"⚠️ [AI-DECISION] response_format توسط {attempt_model} ({tag}) رد شد "
+                        f"({e})؛ تلاش مجدد بدون Structured Output."
+                    )
+                    try:
+                        return _do_call(client, attempt_model, tag, use_response_format=False)
+                    except Exception as e2:
+                        last_error = e2
+                        log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}) retry-without-schema: {e2}")
+                        return None
                 log.error(f"❌ [LLM-ERROR] node={node} model={attempt_model} ({tag}): {e}")
                 return None
             except Exception as e:
@@ -524,45 +646,88 @@ class AIAdvisor:
             ]
             # ===== اصلاح مصرف توکن: تصمیم روی داده‌ی از‌پیش‌آماده‌شده، بدون
             # tool-calling، «تحلیل پیچیده» نیست - مدل سریع/ارزان کافی است. =====
+            # ===== اصلاح ریشه‌ای: Structured Output/JSON Schema داده می‌شود تا در
+            # پرووایدرهایی که پشتیبانی می‌کنند، مدل اصلاً نتواند خروجی خارج از
+            # schema بدهد؛ اگر پرووایدر پشتیبانی نکند، _call_llm خودش بدون آن
+            # دوباره تلاش می‌کند و Parser زیر همچنان متن آزاد را می‌فهمد. =====
             response = self._call_llm(
                 node="buy_recommendation", model=self.fast_model,
                 messages=messages, temperature=0.2, max_tokens=500,
+                response_format={"type": "json_schema", "json_schema": BUY_DECISION_JSON_SCHEMA},
             )
             if response is None:
+                log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION reason='no LLM response'")
                 return None
-            content = response.choices[0].message.content or ""
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start == -1 or end <= start:
-                log.warning(f"decide_buy_recommendation: no JSON in model output: {content[:200]!r}")
-                return None
-            result = json.loads(content[start:end])
 
-            action = result.get("action")
+            # ----- Raw AI -----
+            raw_content = response.choices[0].message.content or ""
+            log.info(f"[AI-DECISION] stage=RAW content={raw_content[:500]!r}")
+
+            # ----- Parsed -----
+            json_text = _extract_json_object(raw_content)
+            if not json_text:
+                log.warning("[AI-DECISION] stage=PARSED status=failed reason='no JSON object found in output'")
+                log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION")
+                return None
+            try:
+                result = json.loads(json_text)
+            except json.JSONDecodeError as e:
+                log.warning(f"[AI-DECISION] stage=PARSED status=failed reason={e}")
+                log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION")
+                return None
+            log.info(f"[AI-DECISION] stage=PARSED result={result!r}")
+
+            # ----- Validation -----
+            decision = result.get("decision")
             reason = result.get("reason")
-            if action not in {"BUY", "WAIT"} or not reason:
-                log.warning(f"decide_buy_recommendation: invalid structure: {result!r}")
-                return None
+            raw_symbol = result.get("symbol")
+            confidence_raw = result.get("confidence")
 
-            symbol = result.get("symbol")
-            if action == "BUY":
-                if not symbol or symbol not in candidate_symbols:
-                    log.warning(
-                        f"decide_buy_recommendation: model returned BUY for {symbol!r} which is not "
-                        f"among fetched candidates {candidate_symbols}; rejecting hallucinated pick."
+            notes = []
+            if decision not in {"BUY", "WAIT", "SELL"}:
+                notes.append(f"decision نامعتبر: {decision!r}")
+            if not reason or not isinstance(reason, str):
+                notes.append("reason خالی/نامعتبر است")
+
+            confidence = None
+            try:
+                confidence = int(confidence_raw)
+                if not (0 <= confidence <= 100):
+                    notes.append(f"confidence خارج از بازه‌ی 0-100 است: {confidence_raw!r}")
+                    confidence = None
+            except (TypeError, ValueError):
+                notes.append(f"confidence نامعتبر: {confidence_raw!r}")
+
+            symbol = None
+            if not notes and decision in {"BUY", "SELL"}:
+                symbol = _normalize_symbol(raw_symbol, candidate_symbols)
+                if not symbol:
+                    notes.append(
+                        f"symbol {raw_symbol!r} پس از normalize در دارایی‌های واقعاً بررسی‌شده "
+                        f"{sorted(candidate_symbols)} نیست"
                     )
-                    return None
+
+            valid = not notes
+            log.info(f"[AI-DECISION] stage=VALIDATION valid={valid} notes={notes}")
+
+            if not valid:
+                log.warning(f"decide_buy_recommendation: rejecting invalid AI output {result!r} ({notes})")
+                log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION")
+                return None
 
             final = {
-                "action": action,
-                "symbol": symbol if action == "BUY" else None,
+                "action": decision,
+                "symbol": symbol if decision in {"BUY", "SELL"} else None,
                 "reason": reason,
+                "confidence": confidence,
                 "considered_symbols": sorted(candidate_symbols),
             }
+            log.info(f"[AI-DECISION] stage=FINAL decision={final!r}")
             self._decision_cache.set("buy_recommendation", context, final)
             return final
         except Exception as e:
             log.error(f"decide_buy_recommendation error: {e}")
+            log.info("[AI-DECISION] stage=FINAL decision=NO_CONFIDENT_ACTION")
             return None
 
     # ===== ابزارها =====
